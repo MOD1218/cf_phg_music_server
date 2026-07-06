@@ -4,10 +4,13 @@ import { SearchService } from './services/search_service.ts';
 import { ShortLinkService } from './services/shortlink_service.ts';
 import { SongListService } from './services/songlist_service.ts';
 import { LyricService } from './services/lyric_service.ts';
+import { AIRecommendService } from './services/ai_recommend_service.ts';
 
 export interface Env {
   DB: D1Database;
   API_KEY?: string;
+  AI_MODEL?: string;
+  AI: any;
 }
 
 const REQUEST_TIMEOUT_MS = 30000;
@@ -84,6 +87,43 @@ const searchService = new SearchService();
 const shortLinkService = new ShortLinkService();
 const songListService = new SongListService();
 const lyricService = new LyricService();
+
+// POST /api/ai/chat - AI 对话接口
+async function handleAIChat(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.json() as any;
+    
+    if (!body.messages || !Array.isArray(body.messages)) {
+      return jsonResponse(null, 400, '缺少 messages 参数（数组格式）');
+    }
+
+    if (body.messages.length === 0) {
+      return jsonResponse(null, 400, 'messages 不能为空');
+    }
+
+    const aiService = new AIRecommendService(env.AI);
+    const result = await aiService.chat({
+      messages: body.messages,
+      model: body.model,
+      max_tokens: body.max_tokens,
+      temperature: body.temperature,
+    }, env.AI_MODEL || '');
+
+    return jsonResponse(result);
+  } catch (error: any) {
+    console.error('[AI Chat] Error:', error.message);
+    return jsonResponse(null, 500, error.message || 'AI 服务调用失败');
+  }
+}
+
+// GET /api/ai/models - 获取可用模型列表
+async function handleGetAIModels(): Promise<Response> {
+  const aiService = new AIRecommendService(null);
+  return jsonResponse({
+    models: aiService.getAvailableModels(),
+    currentModel: '可通过环境变量 AI_MODEL 或请求参数 model 动态切换',
+  });
+}
 
 async function handleImportScriptFromUrl(request: Request, storage: ScriptStorage): Promise<Response> {
   const body = await request.json() as { url: string };
@@ -336,25 +376,16 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
       }
     }
 
-    // 如果正常脚本为空但有熔断脚本（或完全无脚本），降级使用所有支持的脚本 + 标记需要换源
-    let needForceToggle = false;
+    // 如果正常脚本为空，降级使用熔断脚本或立即换源
     if (availableScriptIds.length === 0) {
       if (trippedScriptIds.length > 0) {
-        // ★★★ 关键优化：如果唯一支持的脚本被熔断，直接降级使用（不走复杂换源路径避免QuickJS崩溃）★★★
         availableScriptIds = [...trippedScriptIds];
-        needForceToggle = true;
-        console.log(`[API] ⚠️ 所有支持${originalSource}的脚本均已熔断(${trippedScriptIds.length}个)，降级使用`);
-      }
-      else {
-        for (const s of allScripts) { if (s.supportedSources.includes(originalSource)) availableScriptIds.push(s.id); }
-        if (availableScriptIds.length === 0) {
-          // ★★★ 没有任何脚本支持该源 → 立即换源 ★★★
-          if (allowToggleSource && originalSource !== 'local') {
-            console.log(`[API] 🔄 无脚本支持 ${originalSource}，立即换源, allScripts=${allScripts.length}, allSources=${allScripts.map(s => s.supportedSources.join(',')).join(';')}`);
-            return await handleForceToggle(body, songId, name, singer, originalSource, excludeSources, storage);
-          }
-          return jsonResponse(null, 500, `没有支持 ${originalSource} 源的脚本`, { source: originalSource, allScriptsCount: allScripts.length, allScriptsSources: allScripts.map(s => ({ id: s.id, name: s.name, sources: s.supportedSources })) });
-        } else { needForceToggle = true; }
+        console.log(`[API] 所有支持${originalSource}的脚本均已熔断(${trippedScriptIds.length}个)，降级使用`);
+      } else if (allowToggleSource && originalSource !== 'local') {
+        console.log(`[API] 无脚本支持 ${originalSource}，立即换源, allScripts=${allScripts.length}, allSources=${allScripts.map(s => s.supportedSources.join(',')).join(';')}`);
+        return await handleForceToggle(body, songId, name, singer, originalSource, excludeSources, storage);
+      } else {
+        return jsonResponse(null, 500, `没有支持 ${originalSource} 源的脚本`, { source: originalSource, allScriptsCount: allScripts.length, allScriptsSources: allScripts.map(s => ({ id: s.id, name: s.name, sources: s.supportedSources })) });
       }
     }
 
@@ -455,7 +486,10 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
                 }, 200, '获取成功（换源）');
               }
             }
-            return jsonResponse(null, 500, '获取播放URL失败（黑名单）', { source: originalSource, scriptId: currentScriptId, scriptName: currentScript.name, triedScripts });
+            const circuitTrippedBl = await storage.recordScriptFailure(currentScriptId);
+            if (circuitTrippedBl) console.log(`[API] 脚本 ${currentScript.name} 已触发熔断（黑名单URL）`);
+            lastResult = { scriptId: currentScriptId, scriptName: currentScript.name, message: '黑名单URL' };
+            continue;
           }
 
           await storage.updateScriptStats(currentScriptId, true, responseTime);
@@ -634,13 +668,27 @@ async function handleForceToggle(
     try { rawScript = await storage.getScriptRaw(s.id); } catch (_e) {}
     if (!rawScript) continue;
     const runner = await getOrCreateRunner({ id: s.id, name: s.name, rawScript });
+    const degradeStartTime = Date.now();
     try {
       const result = await runner.request({ source: 'wy', action: 'musicUrl', info: { type: body.quality, musicInfo: { id: songId || '', name, singer, source: 'wy', songmid: songId || '', meta: { songId: songId || '' } } } });
-      if (result.data.url) return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'wy', quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: 'wy' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
+      const degradeResponseTime = Date.now() - degradeStartTime;
+      if (result.data.url) {
+        await storage.updateScriptStats(s.id, true, degradeResponseTime);
+        await storage.recordScriptSuccess(s.id);
+        await storage.updateSourceStats(s.id, 'wy', true);
+        return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'wy', quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: 'wy' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
+      }
+      await storage.updateScriptStats(s.id, false, degradeResponseTime);
+      await storage.updateSourceStats(s.id, 'wy', false);
+      await storage.recordScriptFailure(s.id);
       const diag = runner.getDiagnostics ? runner.getDiagnostics() : null;
       forceToggleLogs.push(`降级wy: url为空`);
       if (diag?.keyLogs) forceToggleLogs.push(...diag.keyLogs.slice(-20));
     } catch (e: any) {
+      const degradeResponseTime = Date.now() - degradeStartTime;
+      await storage.updateScriptStats(s.id, false, degradeResponseTime);
+      await storage.updateSourceStats(s.id, 'wy', false);
+      await storage.recordScriptFailure(s.id);
       const diag = runner.getDiagnostics ? runner.getDiagnostics() : null;
       forceToggleLogs.push(`降级wy异常: ${e.message?.substring(0, 80)}`);
       if (diag?.keyLogs) forceToggleLogs.push(...diag.keyLogs.slice(-20));
@@ -653,13 +701,27 @@ async function handleForceToggle(
     try { rawScript = await storage.getScriptRaw(s.id); } catch (_e) {}
     if (!rawScript) continue;
     const runner = await getOrCreateRunner({ id: s.id, name: s.name, rawScript });
+    const degradeStartTime = Date.now();
     try {
       const result = await runner.request({ source: 'kw', action: 'musicUrl', info: { type: body.quality, musicInfo: { id: songId || '', name, singer, source: 'kw', songmid: songId || '', meta: { songId: songId || '' } } } });
-      if (result.data.url) return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'kw', quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: 'kw' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
+      const degradeResponseTime = Date.now() - degradeStartTime;
+      if (result.data.url) {
+        await storage.updateScriptStats(s.id, true, degradeResponseTime);
+        await storage.recordScriptSuccess(s.id);
+        await storage.updateSourceStats(s.id, 'kw', true);
+        return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'kw', quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: 'kw' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
+      }
+      await storage.updateScriptStats(s.id, false, degradeResponseTime);
+      await storage.updateSourceStats(s.id, 'kw', false);
+      await storage.recordScriptFailure(s.id);
       const diag = runner.getDiagnostics ? runner.getDiagnostics() : null;
       forceToggleLogs.push(`降级kw: url为空`);
       if (diag?.keyLogs) forceToggleLogs.push(...diag.keyLogs.slice(-20));
     } catch (e: any) {
+      const degradeResponseTime = Date.now() - degradeStartTime;
+      await storage.updateScriptStats(s.id, false, degradeResponseTime);
+      await storage.updateSourceStats(s.id, 'kw', false);
+      await storage.recordScriptFailure(s.id);
       const diag = runner.getDiagnostics ? runner.getDiagnostics() : null;
       forceToggleLogs.push(`降级kw异常: ${e.message?.substring(0, 80)}`);
       if (diag?.keyLogs) forceToggleLogs.push(...diag.keyLogs.slice(-20));
@@ -857,6 +919,8 @@ export default {
         search: `GET /${apiKey}/api/search?keyword=xxx&source=kw&page=1&limit=20`,
         songListDetail: `POST /${apiKey}/api/songlist/detail`,
         songListByLink: `POST /${apiKey}/api/songlist/detail/by-link`,
+        aiChat: `POST /${apiKey}/api/ai/chat`,
+        aiModels: `GET /${apiKey}/api/ai/models`,
       }});
     }
 
@@ -899,7 +963,13 @@ export default {
           return await withTimeout(handleGetSongListDetail(request), REQUEST_TIMEOUT_MS);
 
         case `POST /${apiKey}/api/songlist/detail/by-link`:
-          return await withTimeout(handleGetSongListDetailByLink(request), REQUEST_TIMEOUT_MS);
+          return await withTimeout(handleGetSongListDetailByLink(request, storage), REQUEST_TIMEOUT_MS);
+
+        case `POST /${apiKey}/api/ai/chat`:
+          return await withTimeout(handleAIChat(request, env), REQUEST_TIMEOUT_MS);
+
+        case `GET /${apiKey}/api/ai/models`: case `GET /${apiKey}/api/ai/models/`:
+          return await withTimeout(handleGetAIModels(), REQUEST_TIMEOUT_MS);
 
         case `GET /${apiKey}`:
           return jsonResponse({ status: 'ok', version: '1.0.0', endpoints: [

@@ -59,7 +59,11 @@ const ALL_SOURCES = ['kw', 'kg', 'tx', 'wy', 'mg'] as const;
 const MIN_SAMPLES = 5;
 const EPSILON = 0.05;
 const CIRCUIT_BREAKER_THRESHOLD = 3;
-const CIRCUIT_BREAKER_RESET_TIME = 2 * 60 * 60 * 1000;
+const COOLDOWN_LEVELS_MIN = [3, 10, 30, 60, 120]; // 指数退避冷却(分钟): 3min->10min->30min->1h->2h
+function getCooldownMs(tripCount: number): number {
+  const level = Math.min(tripCount - 1, COOLDOWN_LEVELS_MIN.length - 1);
+  return COOLDOWN_LEVELS_MIN[level] * 60 * 1000;
+}
 const STORAGE_KEY = 'app_data';
 
 function emptyAppData(): AppData {
@@ -272,7 +276,7 @@ export class ScriptStorage {
 
   getScriptSuccessRate(stats: ScriptStats): number {
     const total = stats.success + stats.fail;
-    if (total === 0) return 0.5;
+    if (total < MIN_SAMPLES) return 0.5;
     return stats.success / total;
   }
 
@@ -338,6 +342,7 @@ export class ScriptStorage {
     const cb = data.circuitBreakers[scriptId];
     if (!cb || !cb.isTripped) return false;
     if (Date.now() >= cb.resetAt) {
+      // 冷却到期 -> 半开: 放行探测请求, 但保留 tripCount 用于判断半开状态
       cb.isTripped = false;
       cb.consecutiveFails = 0;
       this.markDirty();
@@ -354,11 +359,23 @@ export class ScriptStorage {
     }
     const cb = data.circuitBreakers[scriptId];
     cb.consecutiveFails++;
+
+    // 半开探测失败: tripCount>0 说明熔断过, consecutiveFails===1 说明刚恢复就失败 -> 重新熔断, 冷却升级
+    if (!cb.isTripped && cb.tripCount > 0 && cb.consecutiveFails === 1) {
+      cb.isTripped = true;
+      cb.tripCount++;
+      cb.lastTripAt = Date.now();
+      cb.resetAt = Date.now() + getCooldownMs(cb.tripCount);
+      this.markDirty();
+      return true;
+    }
+
+    // 正常连续失败达阈值 -> 熔断
     if (cb.consecutiveFails >= CIRCUIT_BREAKER_THRESHOLD && !cb.isTripped) {
       cb.isTripped = true;
       cb.tripCount++;
       cb.lastTripAt = Date.now();
-      cb.resetAt = Date.now() + CIRCUIT_BREAKER_RESET_TIME;
+      cb.resetAt = Date.now() + getCooldownMs(cb.tripCount);
       this.markDirty();
       return true;
     }
@@ -370,9 +387,12 @@ export class ScriptStorage {
     await this.ensureCache();
     const data = this._cache!;
     const cb = data.circuitBreakers[scriptId];
-    if (cb?.isTripped) {
+    if (!cb) return;
+    // 半开探测成功 (tripCount>0 && !isTripped) 或降级路径中熔断脚本成功 -> 完全恢复, 重置冷却级别
+    if (cb.tripCount > 0 || cb.isTripped) {
       cb.isTripped = false;
       cb.consecutiveFails = 0;
+      cb.tripCount = 0;
       this.markDirty();
     }
   }
