@@ -20,3 +20,11 @@ index.js
 *.zip
 *.tar.gz
 *.js.bundle
+
+# 测试用脚本资源（外部下载，勿提交）
+script_*.js
+
+# 测试文件（含 API_KEY，勿提交）
+test_app_data_store.py
+test_e2e_real.py
+test_live.py

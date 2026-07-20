@@ -2,6 +2,8 @@
 
 这是一个用 Cloudflare Workers + QuickJS（quickjs-ng.wasm）构建的拼好歌后端服务框架，支持动态执行用户导入的音源脚本插件。本项目不提供音乐数据，数据全部由用户自行导入的脚本返回。此项目参考洛雪音乐源码编写，兼容洛雪音乐第三方音源脚本生态（小部分不兼容）。本项目代码开源且免费，如付费使用，建议申请退款。
 
+**当前版本：v1.0.10 (versionCode: 10010)**
+
 ## 关联项目
 
 - **拼好歌小程序端** - [phg-music](https://github.com/erikjamesgz/phg-music)
@@ -22,50 +24,53 @@
 
 1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com/) → 登录
 2. 左侧菜单 → **Workers 和 Pages**
-3. 页面右上角点击 **创建应用程序**
-4. 选择 “Connect GitHub”（不是"创建Worker"！）
+3. 页面右上角点击 **创建应用程序**
+4. 选择 "Connect GitHub"（不是"创建Worker"！）
 5. 首次使用会提示授权 GitHub 账号 → 点击 **Connect GitHub** → 授权 Cloudflare 访问你的 GitHub
-6. 授权后，选择 “Continue with GitHub”
+6. 授权后，选择 "Continue with GitHub"
 7. 在仓库列表中选择你刚 **Fork** 的 `cf_phg_music_server` 仓库
-8. 然后下一步 ，项目名字填“`cf-phg-music-server`”（不能有下划线）
-9. 然后点击 **“部署”**
+8. 然后下一步 ，项目名字填"`cf-phg-music-server`"（不能有下划线）
+9. 然后点击 **"部署"**
 
-#### 第 4 步：创建 D1 数据库
+#### 第 3 步：创建 D1 数据库
 
 1. Cloudflare 左侧菜单 → **存储和数据库** → **D1 SQL 数据库**
 2. 页面右上角点击 **创建数据库**
 3. 名称填：`cf-phg-music-db` → **创建**
 
-#### 第 5 步：绑定 D1 数据库到 Worker
+#### 第 4 步：绑定 D1 数据库到 Worker
 
 1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单→计算→**Workers 和 Pages** → 点击项目`cf-phg-music-server`）
-2. 页面左上角的菜单栏点击“绑定”
-3. 找到 **绑定** 区域 →弹窗中选择 **D1 数据库** → **添加**
+2. 页面左上角的菜单栏点击"绑定"
+3. 找到 **绑定** 区域 →弹窗中选择 **D1 数据库** → **添加**
 4. 变量名称填：`DB (要大写)`
 5. 数据库选择：`cf-phg-music-db`
-6. 点击“添加绑定”
+6. 点击"添加绑定"
 
-#### 第 6 步：修改 API Key
+#### 第 5 步：修改 API Key 和 PUBLIC_KEY
 
 默认 API Key 是 `c5cb88052fcfc21ee4a48ab7e3d3d964`
 
-1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单 → 计算 → **Workers 和 Pages** → 点击项目`cf-phg-music-server`）
-2. 页面左上角的菜单栏点击“设置”→ **变量和机密**
-3. 编辑 `API_KEY` 变量为你想要的值，这是接口访问的秘钥非常重要
+1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单 → 计算 → **Workers 和 Pages** → 点击项目`cf-phg-music-server`）
+2. 页面左上角的菜单栏点击"设置"→ **变量和机密**
+3. 编辑 `API_KEY` 变量为你想要的值，这是接口访问的秘钥非常重要,一定要修改！！
+4. 添加 `PUBLIC_KEY` 变量（32位hex字符串，用于公共分享路由，如 `a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6`）
 
-#### 第 7 步：获取项目访问链接
+> **关于 PUBLIC_KEY**：这是 v1.0.10 新增的独立公开密钥，用于"分享计划"公共路由（`/{publicKey}/share/...`），与 `API_KEY` 分离。`API_KEY` 兼作 Owner Key，用于管理路由。如果不设置 `PUBLIC_KEY`，分享计划功能不可用。
 
-1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单 → 计算 → **Workers 和 Pages** → 点击项目`cf-phg-music-server`）
-2. 页面左上角的菜单栏点击“设置”→**域和路由**
-3. 复制你**workers.dev 对应的值（值的格式为：“xxxx.workers.dev”）**
-4. 复制第六步的`API_KEY 的值`**（值的格式为“**`c5cb88052fcfc21ee4a48ab7e3d3dxxxx`**”）**
+#### 第 6 步：获取项目访问链接
+
+1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单 → 计算 → **Workers 和 Pages** → 点击项目`cf-phg-music-server`）
+2. 页面左上角的菜单栏点击"设置"→**域和路由**
+3. 复制你**workers.dev 对应的值（值的格式为："xxxx.workers.dev"）**
+4. 复制第五步的`API_KEY 的值`**（值的格式为"`c5cb88052fcfc21ee4a48ab7e3d3dxxxx`"）**
 5. 组成访问地址格式：
 
 ```
 https://xxxx.workers.dev/你的API_KEY
 ```
 
-#### 第 8 步：注册域名（如需国内访问）
+#### 第 7 步：注册域名（如需国内访问）
 
 Workers 默认域名（`*.workers.dev`）在中国大陆**无法访问**，需要绑定自定义域名才能正常使用。
 
@@ -78,10 +83,10 @@ Workers 默认域名（`*.workers.dev`）在中国大陆**无法访问**，需�
 
 **INDEVS.in 注册教程**：[视频教程](https://www.youtube.com/watch?v=7cZC4G7je1U)
 
-#### 第 9 步：绑定自定义域名到 Worker
+#### 第 8 步：绑定自定义域名到 Worker
 
-1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单 → 计算 → **Workers 和 Pages** → 点击项目`cf-phg-music-server`）
-2. 页面左上角的菜单栏点击“设置”→**域和路由**
+1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单 → 计算 → **Workers 和 Pages** → 点击项目`cf-phg-music-server`）
+2. 页面左上角的菜单栏点击"设置"→**域和路由**
 3. 点击 **添加** → 选择 **自定义域**
 4. 输入你注册的域名（如 `phg-music.indevs.in`）→ 点击 **添加域**
 
@@ -112,10 +117,42 @@ https://你的域名/你的API_KEY
 
 | 套餐  | 可支持人数         |
 | --- | ------------- |
-| 免费版 | **\~2000人/天** |
-| 付费版 | **\~7000人/天** |
+| 免费版 | **~2000人/天** |
+| 付费版 | **~7000人/天** |
 
 **结论**：免费版完全够用，即使几百人同时使用也绰绰有余。
+
+***
+
+## 存储架构
+
+### AppDataStore（统一存储）
+
+v1.0.10 引入了统一的 `AppDataStore`（`src/app_data.ts`），所有数据读写都经过这个入口：
+
+- **串行化写入**：通过写队列（`_writeQueue`）排队执行，避免并发写入竞态
+- **JSON 损坏保护**：如果检测到 JSON 解析失败，设置 `_corrupted` 标志，拒绝后续写入（防止用默认值覆盖损坏的数据）
+- **数据迁移**：自动从旧格式（驼峰命名）迁移到新格式（下划线命名）
+- **缓存失效**：每个请求开始时调用 `invalidateCache()`，确保跨 Isolate 读到最新 DB 数据
+
+### 数据结构
+
+```
+app_data (D1 storage key)
+├── share_config: { status, node_id, daily_limit, reserved_limit, contributor_name, shared_since }
+├── usage: { daily: { "2026-07-20": { share, api } }, share_total, api_total }
+├── scripts: ScriptInfo[]
+├── script_stats: { [id]: { script: ScriptStats, sources: { [source]: SourceStats } } }
+├── circuit_breakers: { [id]: CircuitBreakerState }
+└── default_source_id: string | null
+```
+
+### ScriptStorage 改造
+
+`ScriptStorage` 不再直接读写 DB，而是委托给 `AppDataStore`：
+- 所有写操作通过 `store.update(callback)` 串行化执行
+- `flush()` 现在是 no-op（写操作已即时落盘）
+- `ScriptStorage` 和 `index.ts` 共享同一个 `AppDataStore` 实例
 
 ***
 
@@ -133,11 +170,11 @@ https://你的域名/你的API_KEY
 }
 ```
 
-| 字段   | 类型          | 说明                                    |
-| ---- | ----------- | ------------------------------------- |
-| code | number      | 状态码：200=成功，400=参数错误，404=未找到，500=服务器错误 |
-| msg  | string      | 响应消息                                  |
-| data | object/null | 响应数据，失败时可能为 null                      |
+| 字段   | 类型          | 说明                                            |
+| ---- | ----------- | --------------------------------------------- |
+| code | number      | 状态码：200=成功，400=参数错误，403=无权限，410=未导入脚本，411=无支持源，412=换源失败，429=限额满，500=服务器错误 |
+| msg  | string      | 响应消息                                          |
+| data | object/null | 响应数据，失败时可能为 null                              |
 
 ***
 
@@ -146,8 +183,10 @@ https://你的域名/你的API_KEY
 ### 1.1 获取服务信息
 
 ```http
-GET /{apiKey}
+GET /{apiKey}/status
 ```
+
+返回服务版本、分享状态、用量统计等信息。客户端可据此检查连通性和版本兼容性。
 
 **响应示例：**
 
@@ -157,18 +196,22 @@ GET /{apiKey}
   "msg": "success",
   "data": {
     "status": "ok",
-    "version": "1.0.0",
-    "endpoints": [
-      "POST /{key}/api/scripts/import/url - 导入脚本",
-      "POST /{key}/api/music/url - 获取音乐URL",
-      "GET /{key}/api/scripts/loaded - 已加载脚本列表",
-      "POST /{key}/api/scripts/default - 设置默认脚本",
-      "GET /{key}/api/scripts/default - 获取默认脚本",
-      "POST /{key}/api/scripts/delete - 删除脚本",
-      "GET /{key}/api/search?keyword=xxx - 搜索歌曲",
-      "POST /{key}/api/songlist/detail - 歌单详情",
-      "POST /{key}/api/songlist/detail/by-link - 链接解析歌单"
-    ]
+    "serverVersion": "1.0.10",
+    "serverVersionCode": 10010,
+    "platform": "cloudflare",
+    "minClientVersion": "1.0.01",
+    "minClientVersionCode": 1001,
+    "public_key": "a1b2c3d4...",
+    "share_status": 1,
+    "node_id": "phg-xxxx-xxxx",
+    "daily_limit": 50000,
+    "reserved_limit": 20000,
+    "current_usage": 123,
+    "contributor_name": "我的节点",
+    "remaining": 49877,
+    "api_call_stats": [{ "date": "2026-07-20", "count": 45 }],
+    "api_call_total": 1234,
+    "shared_since": 1737000000000
   }
 }
 ```
@@ -206,25 +249,6 @@ GET /{apiKey}/api/scripts/loaded
 }
 ```
 
-**响应字段说明：**
-
-| 字段               | 类型        | 说明           |
-| ---------------- | --------- | ------------ |
-| id               | string    | 脚本唯一标识       |
-| name             | string    | 音源名称         |
-| description      | string    | 音源描述         |
-| author           | string    | 作者           |
-| homepage         | string    | 主页地址         |
-| version          | string    | 版本号          |
-| createdAt        | string    | 创建时间（ISO 格式） |
-| supportedSources | string\[] | 支持的平台代码      |
-| isDefault        | boolean   | 是否为默认音源      |
-| successRate      | number    | 请求成功率（0-1）   |
-| successCount     | number    | 成功次数         |
-| failCount        | number    | 失败次数         |
-| totalRequests    | number    | 总请求数         |
-| isCircuitBroken  | boolean   | 是否触发熔断       |
-
 ### 1.3 从 URL 导入脚本
 
 ```http
@@ -236,31 +260,19 @@ Content-Type: application/json
 }
 ```
 
-**请求参数：**
+### 1.4 从原始内容导入脚本
 
-| 字段  | 类型     | 必填 | 说明     |
-| --- | ------ | -- | ------ |
-| url | string | 是  | 脚本下载地址 |
+```http
+POST /{apiKey}/api/scripts/import/raw
+Content-Type: application/json
 
-**响应示例：**
-
-```json
 {
-  "code": 200,
-  "msg": "从URL导入成功",
-  "data": {
-    "success": true,
-    "defaultSource": {
-      "id": "user_api_abc123",
-      "name": "六音音源",
-      "supportedSources": ["kw", "kg", "tx", "wy", "mg"]
-    },
-    "scripts": [...]
-  }
+  "name": "音源名称",
+  "content": "base64编码的脚本内容"
 }
 ```
 
-### 1.4 设置默认音源
+### 1.5 设置默认音源
 
 ```http
 POST /{apiKey}/api/scripts/default
@@ -271,15 +283,7 @@ Content-Type: application/json
 }
 ```
 
-**请求参数：**
-
-| 字段 | 类型     | 必填 | 说明   |
-| -- | ------ | -- | ---- |
-| id | string | 是  | 脚本ID |
-
-**注意**：设置不存在的脚本ID会返回 500 错误
-
-### 1.5 删除脚本
+### 1.6 删除脚本
 
 ```http
 POST /{apiKey}/api/scripts/delete
@@ -290,16 +294,7 @@ Content-Type: application/json
 }
 ```
 
-**请求参数：**
-
-| 字段 | 类型     | 必填 | 说明       |
-| -- | ------ | -- | -------- |
-| id | string | 是  | 要删除的脚本ID |
-
-**注意**：
-
-- 删除不存在的脚本会返回 500 错误
-- 如果删除的是默认音源，系统会自动将剩余的第一个音源设为默认
+**注意**：如果删除的是默认音源，系统会自动将剩余的第一个音源设为默认。
 
 ***
 
@@ -353,32 +348,46 @@ Content-Type: application/json
     "type": "320k",
     "source": "kw",
     "quality": "320k",
+    "lyric": "[00:00.00]歌词内容...",
+    "tlyric": "[00:00.00]翻译歌词...",
+    "rlyric": "[00:00.00]罗马音歌词...",
+    "lxlyric": "[00:00.00]逐字歌词...",
     "cached": false,
     "fallback": {
       "toggled": false,
       "originalSource": "kw"
     },
     "scriptId": "user_api_abc123",
-    "scriptName": "六音音源"
+    "scriptName": "六音音源",
+    "triedScripts": []
   }
 }
 ```
 
-**响应字段说明：**
+**换源响应示例**（当原始源获取失败，自动切换到其他平台）：
 
-| 字段                      | 类型      | 说明                       |
-| ----------------------- | ------- | ------------------------ |
-| url                     | string  | 播放地址                     |
-| type                    | string  | 实际音质类型                   |
-| source                  | string  | 实际获取成功的平台代码              |
-| quality                 | string  | 请求的音质                    |
-| cached                  | boolean | 是否来自缓存                   |
-| fallback.toggled        | boolean | 是否发生了换源                  |
-| fallback.originalSource | string  | 原始请求的平台                  |
-| fallback.newSource      | string  | 换源后的平台（仅toggled=true时存在） |
-| fallback.matchedSong    | object  | 换源匹配到的歌曲信息               |
-| scriptId                | string  | 使用的脚本ID                  |
-| scriptName              | string  | 使用的脚本名称                  |
+```json
+{
+  "code": 200,
+  "msg": "获取成功（换源）",
+  "data": {
+    "url": "https://example.com/music.mp3",
+    "source": "wy",
+    "fallback": {
+      "toggled": true,
+      "originalSource": "kw",
+      "newSource": "wy",
+      "matchedSong": {
+        "id": "123456",
+        "songmid": "123456",
+        "name": "演员",
+        "singer": "薛之谦",
+        "source": "wy"
+      }
+    }
+  }
+}
+```
 
 ### 2.2 获取歌词
 
@@ -396,21 +405,6 @@ Content-Type: application/json
 | name   | string | 否  | 歌曲名称（咪咕、酷狗需要） |
 | singer | string | 否  | 歌手名称（咪咕需要）    |
 
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "msg": "获取歌词成功",
-  "data": {
-    "lyric": "[00:00.00]歌词内容...",
-    "tlyric": "[00:00.00]翻译歌词...",
-    "rlyric": "[00:00.00]罗马音歌词...",
-    "lxlyric": "[00:00.00]逐字歌词..."
-  }
-}
-```
-
 ***
 
 ## 三、搜索接口
@@ -421,45 +415,12 @@ Content-Type: application/json
 GET /{apiKey}/api/search?keyword=演员&source=kw&page=1&limit=20
 ```
 
-**请求参数（Query String）：**
-
 | 字段      | 类型     | 必填 | 说明             |
 | ------- | ------ | -- | -------------- |
 | keyword | string | 是  | 搜索关键词          |
 | source  | string | 否  | 指定平台，不传则搜索所有平台 |
 | page    | number | 否  | 页码，默认1         |
 | limit   | number | 否  | 每页数量，默认20      |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "msg": "success",
-  "data": [
-    {
-      "platform": "kw",
-      "name": "酷我音乐",
-      "results": [
-        {
-          "id": "MUSIC_12345678",
-          "name": "演员",
-          "singer": "薛之谦",
-          "album": "绅士",
-          "source": "kw",
-          "interval": 270,
-          "musicInfo": {
-            "id": "MUSIC_12345678",
-            "name": "演员",
-            "singer": "薛之谦",
-            "songmid": "MUSIC_12345678"
-          }
-        }
-      ]
-    }
-  ]
-}
-```
 
 ***
 
@@ -470,53 +431,10 @@ GET /{apiKey}/api/search?keyword=演员&source=kw&page=1&limit=20
 ```http
 POST /{apiKey}/api/songlist/detail
 Content-Type: application/json
-```
 
-**请求参数：**
-
-| 字段     | 类型     | 必填 | 说明                      |
-| ------ | ------ | -- | ----------------------- |
-| source | string | 是  | 平台代码：wy, tx, kg, kw, mg |
-| id     | string | 是  | 歌单ID或歌单链接               |
-
-**请求示例：**
-
-```json
 {
   "source": "wy",
   "id": "123456789"
-}
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "msg": "获取歌单详情成功",
-  "data": {
-    "list": [
-      {
-        "id": "123456",
-        "name": "演员",
-        "singer": "薛之谦",
-        "albumName": "绅士",
-        "interval": "04:30",
-        "source": "wy",
-        "songmid": "123456"
-      }
-    ],
-    "page": 1,
-    "limit": 100,
-    "total": 50,
-    "source": "wy",
-    "info": {
-      "name": "我的歌单",
-      "img": "https://example.com/cover.jpg",
-      "desc": "歌单描述",
-      "author": "创建者"
-    }
-  }
 }
 ```
 
@@ -531,7 +449,130 @@ Content-Type: application/json
 }
 ```
 
-## 五、音质代码对照表
+***
+
+## 五、分享计划接口（v1.0.10 新增）
+
+分享计划允许服务器所有者将自己的音源脚本共享给"公共服务器模式"的用户。通过 `PUBLIC_KEY` 暴露公共路由，与 `API_KEY` 管理路由分离。
+
+### 5.1 公共状态查询
+
+```http
+GET /{publicKey}/status
+```
+
+无需鉴权，返回服务版本和分享状态。
+
+**响应示例：**
+
+```json
+{
+  "code": 200,
+  "data": {
+    "status": "ok",
+    "serverVersion": "1.0.10",
+    "serverVersionCode": 10010,
+    "share_status": 1,
+    "node_id": "phg-xxxx-xxxx",
+    "daily_limit": 50000,
+    "current_usage": 123,
+    "remaining": 49877,
+    "service": "cf-phg-music-server"
+  }
+}
+```
+
+### 5.2 共享获取播放URL
+
+```http
+POST /{publicKey}/share/music-url
+Content-Type: application/json
+```
+
+客户端传入自己的音源脚本（inline 模式），服务器执行脚本获取播放链接。
+
+**请求参数：**
+
+| 字段                | 类型       | 必填 | 说明                              |
+| ----------------- | -------- | -- | ------------------------------- |
+| source            | string   | 是  | 音乐平台代码                          |
+| quality           | string   | 是  | 音质                              |
+| scriptContent     | string   | 否  | Base64 编码的脚本内容（单脚本模式，向后兼容）      |
+| scriptName        | string   | 否  | 脚本名称                            |
+| scripts           | array   | 否  | 多脚本数组（`[{content, name, isDefault}]`） |
+| musicInfo         | object   | 否  | 歌曲信息                            |
+| allowToggleSource | boolean  | 否  | 是否允许换源，默认 true                  |
+| excludeSources    | string[] | 否  | 换源时排除的平台                        |
+
+**响应示例：**
+
+```json
+{
+  "code": 200,
+  "data": {
+    "url": "https://example.com/music.mp3",
+    "source": "kw",
+    "quality": "320k",
+    "lyric": "...",
+    "share_info": {
+      "daily_limit": 50000,
+      "current_usage": 124,
+      "remaining": 49876,
+      "reserved_limit": 20000,
+      "contributor_name": "我的节点"
+    }
+  }
+}
+```
+
+### 5.3 共享歌单详情
+
+```http
+POST /{publicKey}/share/songlist-detail
+Content-Type: application/json
+```
+
+供免费模式客户端获取QQ音乐歌单（小程序无法设置正确的 Referer）。
+
+### 5.4 管理分享配置
+
+```http
+POST /owner/{apiKey}/share/config
+Content-Type: application/json
+
+{
+  "status": 1,
+  "daily_limit": 50000,
+  "reserved_limit": 20000,
+  "contributor_name": "我的节点"
+}
+```
+
+| 字段               | 类型     | 说明                                    |
+| ---------------- | ------ | ------------------------------------- |
+| status           | number | 0=关闭分享, 1=开启分享, 2=被注册中心踢下线           |
+| daily_limit      | number | 每日分享限额                                |
+| reserved_limit   | number | 保留限额（达到后停止服务外部用户，保留给自用）               |
+| contributor_name | string | 节点名称（显示在客户端节点列表）                      |
+
+> 每次开启分享（status→1）时自动重新生成 `node_id`。
+
+### 5.5 注册中心踢下线
+
+```http
+POST /{publicKey}/share/config
+Content-Type: application/json
+
+{
+  "status": 2
+}
+```
+
+注册中心可调用此接口将异常节点踢下线（仅允许设置 status=2）。
+
+***
+
+## 六、音质代码对照表
 
 | 代码        | 音质     | 说明          |
 | --------- | ------ | ----------- |
@@ -544,21 +585,51 @@ Content-Type: application/json
 
 ***
 
-## 六、curl 测试命令
+## 七、换源机制
 
-### 7.1 获取服务信息
+当原始源获取失败时，服务器会自动搜索其他平台，按歌名+歌手匹配最佳结果并重试。
 
-```bash
-curl https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY
+### 换源流程
+
+```
+原始源获取失败
+  ↓
+performToggleSearch() — 并行搜索所有候选源（含原始源，修正错误ID）
+  ↓
+findBestMatch() — 按歌名+歌手+时长+专辑精确匹配
+  ↓
+tryToggleSourceInternal() — 按匹配度+成功率排序，依次尝试
+  ↓
+成功 → 返回 URL + matchedSong（含新源的正确ID）+ 歌词
+失败 → 继续尝试下一个匹配结果
+全部失败 → 返回错误
 ```
 
-### 7.2 获取已加载音源
+### 关键特性
+
+- **搜索缓存**：一次请求只搜索一次，后续换源复用结果（避免重复搜索）
+- **含原始源搜索**：换源时也搜索原始源（修正过期的 songId）
+- **黑名单URL检测**：返回已知无效URL时跳过，记录失败
+- **歌词获取**：换源成功后，根据 matchedSong 的新源信息获取对应歌词
+- **用量计数**：换源成功也计入 share usage
+
+***
+
+## 八、curl 测试命令
+
+### 获取服务信息
+
+```bash
+curl https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/status
+```
+
+### 获取已加载音源
 
 ```bash
 curl https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/api/scripts/loaded
 ```
 
-### 7.3 从URL导入音源脚本
+### 从URL导入音源脚本
 
 ```bash
 curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/api/scripts/import/url \
@@ -566,13 +637,13 @@ curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/
   -d '{"url":"https://ghproxy.net/https://raw.githubusercontent.com/pdone/lx-music-source/main/sixyin/latest.js"}'
 ```
 
-### 7.4 搜索歌曲
+### 搜索歌曲
 
 ```bash
 curl "https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/api/search?keyword=演员&source=kw&limit=10"
 ```
 
-### 7.5 获取播放URL
+### 获取播放URL
 
 ```bash
 curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/api/music/url \
@@ -586,20 +657,34 @@ curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/
   }'
 ```
 
-### 7.6 获取歌词
+### 获取歌词
 
 ```bash
 curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/api/music/lyric \
   -H 'Content-Type: application/json' \
+  -d '{"source": "kw", "songId": "MUSIC_12345678"}'
+```
+
+### 公共分享接口测试
+
+```bash
+# 查询公共状态
+curl https://cf-phg-music-server.你的账户.workers.dev/你的PUBLIC_KEY/status
+
+# 共享获取播放URL
+curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的PUBLIC_KEY/share/music-url \
+  -H 'Content-Type: application/json' \
   -d '{
     "source": "kw",
-    "songId": "MUSIC_12345678"
+    "quality": "320k",
+    "musicInfo": {"songmid": "MUSIC_12345678", "name": "演员", "singer": "薛之谦"},
+    "scriptContent": "base64编码的脚本内容"
   }'
 ```
 
 ***
 
-## 七、脚本开发指南
+## 九、脚本开发指南
 
 建议参考洛雪音乐的指引：<https://lxmusic.toside.cn/desktop/custom-source>
 
@@ -675,21 +760,39 @@ const md5Hash = lx.utils.crypto.md5('string');
 
 ***
 
-## 八、环境变量
+## 十、环境变量
 
-| 变量名      | 说明                                                               |
-| -------- | ---------------------------------------------------------------- |
-| API\_KEY | API密钥，不设置则使用默认值，（一定要不然容易被人盗）用 `c5cb88052fcfc21ee4a48ab7e3d3d964` |
+| 变量名        | 说明                                                                 |
+| ---------- | ------------------------------------------------------------------ |
+| API_KEY    | API密钥（兼作 Owner Key），不设置则使用默认值 `c5cb88052fcfc21ee4a48ab7e3d3d964`，**一定要修改** |
+| PUBLIC_KEY | 公开密钥（v1.0.10新增），32位hex字符串，用于分享计划公共路由，与 API_KEY 分离                  |
+| AI_MODEL   | AI 模型名称，默认 `@cf/qwen/qwen3-30b-a3b-fp8`                            |
+| DB         | D1 数据库绑定（变量名必须大写）                                                  |
+| AI         | Cloudflare AI 绑定                                                    |
 
 ### API Key 使用说明
 
-服务启动后所有接口需要在路径中包含 API Key，格式：`/{apiKey}/api/...`
-
-例如：`/{apiKey}/api/scripts`、`/{apiKey}/api/music/url`
+- **管理路由**：`/{apiKey}/api/...`、`/owner/{apiKey}/...` — 需要 API_KEY
+- **公共路由**：`/{publicKey}/share/...`、`/{publicKey}/status` — 需要 PUBLIC_KEY
 
 ***
 
-## 九、项目协议
+## 十一、错误码
+
+| 状态码 | 说明                          |
+| --- | --------------------------- |
+| 200 | 成功                          |
+| 400 | 参数错误                        |
+| 403 | 无权限（分享未开启 / Owner Key 错误）   |
+| 410 | 尚未导入任何音源脚本                  |
+| 411 | 没有支持该源的脚本                   |
+| 412 | 换源失败（所有源都试过了）               |
+| 429 | 每日分享限额已达上限                  |
+| 500 | 服务器内部错误                     |
+
+***
+
+## 十二、项目协议
 
 本项目基于 Apache License 2.0 许可证发行，以下协议是对于 Apache License 2.0 的补充，如有冲突，以以下协议为准。
 

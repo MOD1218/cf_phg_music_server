@@ -5,15 +5,26 @@ import { ShortLinkService } from './services/shortlink_service.ts';
 import { SongListService } from './services/songlist_service.ts';
 import { LyricService } from './services/lyric_service.ts';
 import { AIRecommendService } from './services/ai_recommend_service.ts';
+import { AppDataStore, type AppData, type ShareConfig, getTodayDateString, cleanupUsageDaily, defaultAppData } from './app_data.ts';
+import pkg from '../package.json';
 
 export interface Env {
   DB: D1Database;
-  API_KEY?: string;
+  API_KEY?: string;       // 主密钥（兼作 Owner Key）
+  PUBLIC_KEY?: string;     // 公开密钥（独立配置，32位hex，可修改）
   AI_MODEL?: string;
   AI: any;
 }
 
 const REQUEST_TIMEOUT_MS = 30000;
+
+// ==================== 版本信息（来自 package.json） ====================
+const SERVER_VERSION = pkg.version;             // "1.0.10"
+const SERVER_VERSION_CODE = (pkg as any).versionCode || 10010;  // 10010
+const SERVER_PLATFORM = 'cloudflare';
+// 本服务端要求的最低客户端版本
+const MIN_CLIENT_VERSION = '1.0.01';
+const MIN_CLIENT_VERSION_CODE = 1001;
 
 // ========== ScriptRunner 缓存（CF Workers Isolate 级别） ==========
 // CF Workers 在同一 Isolate 内复用模块级变量。
@@ -283,59 +294,7 @@ async function handleGetSongListDetailByLink(request: Request): Promise<Response
   } catch (e: any) { return jsonResponse(null, 500, e.message || '解析链接失败'); }
 }
 
-// POST /api/music/url/inline - inline模式(直接传脚本)
-async function handleGetMusicUrlWithScript(request: Request): Promise<Response> {
-  const body = await request.json() as any;
-  if (!body.source || !body.quality || !body.scriptContent) return jsonResponse(null, 400, '缺少必要参数: source, quality, scriptContent');
-
-  let rawScript = body.scriptContent;
-  try { rawScript = atob(rawScript); } catch (_e) {}
-  const scriptInfo = { id: 'inline_script', name: body.scriptName || 'Inline Script', rawScript };
-  const runner = await getOrCreateRunner(scriptInfo);
-
-  const musicInfo = body.musicInfo || {};
-  const songId = body.songmid || body.id || body.songId || musicInfo?.id || musicInfo?.songmid || '';
-
-  try {
-    const result = await runner.request({
-      source: body.source, action: 'musicUrl',
-      info: {
-        type: body.quality,
-        musicInfo: {
-          id: songId,
-          name: musicInfo?.name || '',
-          singer: musicInfo?.singer || '',
-          source: body.source,
-          songmid: songId,
-          interval: musicInfo?.interval || 0,
-          meta: {
-            songId: songId,
-            albumName: musicInfo?.albumName || musicInfo?.album || '',
-            picUrl: musicInfo?.picUrl || musicInfo?.img || '',
-            hash: musicInfo?.hash || musicInfo?.meta?.hash || '',
-            strMediaMid: musicInfo?.strMediaMid || musicInfo?.meta?.strMediaMid || '',
-            copyrightId: musicInfo?.copyrightId || musicInfo?.meta?.copyrightId || '',
-          },
-          typeUrl: {},
-          albumId: musicInfo?.albumId || musicInfo?.meta?.albumId || '',
-          types: musicInfo?.types || musicInfo?.qualitys || musicInfo?.meta?.qualitys || [],
-          _types: {},
-          hash: musicInfo?.hash || musicInfo?.meta?.hash || '',
-          copyrightId: musicInfo?.copyrightId || musicInfo?.meta?.copyrightId || '',
-          strMediaMid: musicInfo?.strMediaMid || musicInfo?.meta?.strMediaMid || '',
-          albumMid: musicInfo?.albumMid || musicInfo?.meta?.albumMid || '',
-          songId: musicInfo?.songId || musicInfo?.meta?.songId || songId,
-          lrcUrl: musicInfo?.lrcUrl || musicInfo?.meta?.lrcUrl || '',
-          mrcUrl: musicInfo?.mrcUrl || musicInfo?.meta?.mrcUrl || '',
-          trcUrl: musicInfo?.trcUrl || musicInfo?.meta?.trcUrl || ''
-        }
-      },
-    });
-    return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: body.source, quality: body.quality });
-  } catch (error: any) { return jsonResponse(null, 500, error.message || '获取播放URL失败'); }
-}
-
-// 动态计算每个脚本的超时时间（ms）
+// POST /api/music/url - 核心接口，支持换脚本和换源（含熔断/统计/重试/换源）
 // 总超时固定 15000ms，根据可用脚本数量分配
 // 1脚本=15000ms, 2脚本=7300ms, 3+脚本=4300ms
 function calculateScriptTimeouts(scriptIds: string[], realAvailableCount: number): Map<string, number> {
@@ -348,7 +307,7 @@ function calculateScriptTimeouts(scriptIds: string[], realAvailableCount: number
 }
 
 // POST /api/music/url - 核心接口，支持换脚本和换源（含熔断/统计/重试/换源）
-async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Promise<Response> {
+async function handleGetMusicUrl(request: Request, storage: ScriptStorage, env?: Env): Promise<Response> {
   let scriptId = 'unknown';
   let scriptName = 'unknown';
 
@@ -378,6 +337,10 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
 
     // 如果正常脚本为空，降级使用熔断脚本或立即换源
     if (availableScriptIds.length === 0) {
+      // 特殊情况：服务器上一个脚本都没导入，返回特定错误码让客户端引导导入
+      if (allScripts.length === 0) {
+        return jsonResponse(null, 410, '尚未导入任何音源脚本，请先导入音源脚本');
+      }
       if (trippedScriptIds.length > 0) {
         availableScriptIds = [...trippedScriptIds];
         console.log(`[API] 所有支持${originalSource}的脚本均已熔断(${trippedScriptIds.length}个)，降级使用`);
@@ -385,7 +348,7 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
         console.log(`[API] 无脚本支持 ${originalSource}，立即换源, allScripts=${allScripts.length}, allSources=${allScripts.map(s => s.supportedSources.join(',')).join(';')}`);
         return await handleForceToggle(body, songId, name, singer, originalSource, excludeSources, storage);
       } else {
-        return jsonResponse(null, 500, `没有支持 ${originalSource} 源的脚本`, { source: originalSource, allScriptsCount: allScripts.length, allScriptsSources: allScripts.map(s => ({ id: s.id, name: s.name, sources: s.supportedSources })) });
+        return jsonResponse(null, 411, `没有支持 ${originalSource} 源的脚本`);
       }
     }
 
@@ -395,6 +358,9 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
 
     const triedScripts: { scriptId: string; scriptName: string; message: string; responseTime: number; diagnostics?: any }[] = [];
     let lastResult: any = null;
+
+    // 换源搜索缓存：一次请求只搜索一次，后续换源复用结果
+    let toggleSearchCache: any[] | null = null;
 
     // 预先启动歌词获取（并行）
     const lyricPromise = getLyricForMusicUrl(body, songId, name, singer, originalSource);
@@ -475,18 +441,32 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
             await storage.updateSourceStats(currentScriptId, originalSource, false);
             if (allowToggleSource) {
               const elapsedMs = responseTime;
-              const toggleResult = await tryToggleSourceInternal(body, songId, name, singer, originalSource, excludeSources, currentScriptId, currentScript.name, runner, storage, elapsedMs);
+              if (toggleSearchCache === null) {
+                const keyword = `${name} ${singer}`.trim();
+                const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+                const sourcesToTry = allSources.filter(s => !excludeSources.includes(s));
+                toggleSearchCache = await performToggleSearch(keyword, sourcesToTry, name, singer, body, '[ToggleSource]');
+                console.log(`[ToggleSource] 首次搜索完成，共 ${toggleSearchCache.length} 个匹配`);
+              }
+              const toggleResult = await tryToggleSourceInternal(body, songId, name, singer, originalSource, excludeSources, currentScriptId, currentScript.name, runner, storage, elapsedMs, toggleSearchCache);
               if (toggleResult.success && toggleResult.url) {
+                const toggleLyric = await Promise.race([
+                  getLyricForMatchedSong(toggleResult.matchedSong),
+                  new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))
+                ]);
+                await incrementShareUsage(env?.DB);
                 return jsonResponse({
                   url: toggleResult.url, type: toggleResult.type || body.quality, source: toggleResult.newSource,
-                  quality: body.quality, lyric: '', cached: false,
-                  fallback: { toggled: true, originalSource, newSource: toggleResult.newSource, matchedSong: { name: toggleResult.matchedName, singer: toggleResult.matchedSinger } },
-                  scriptId: currentScriptId, scriptName: currentScript.name,
-                  triedScripts: triedScripts.length > 0 ? triedScripts : undefined,
-                }, 200, '获取成功（换源）');
-              }
-            }
-            const circuitTrippedBl = await storage.recordScriptFailure(currentScriptId);
+                  quality: body.quality, lyric: toggleLyric.lyric, tlyric: toggleLyric.tlyric, rlyric: toggleLyric.rlyric, lxlyric: toggleLyric.lxlyric, cached: false,
+fallback: { toggled: true, originalSource, newSource: toggleResult.newSource, matchedSong: toggleResult.matchedSong || { name: toggleResult.matchedName, singer: toggleResult.matchedSinger } },
+scriptId: currentScriptId, scriptName: currentScript.name,
+triedScripts: triedScripts.length > 0 ? triedScripts : undefined,
+}, 200, '获取成功（换源）');
+}
+}
+// 换源成功也计入 share usage
+await incrementShareUsage(env?.DB);
+const circuitTrippedBl = await storage.recordScriptFailure(currentScriptId);
             if (circuitTrippedBl) console.log(`[API] 脚本 ${currentScript.name} 已触发熔断（黑名单URL）`);
             lastResult = { scriptId: currentScriptId, scriptName: currentScript.name, message: '黑名单URL' };
             continue;
@@ -497,6 +477,9 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
           await storage.updateSourceStats(currentScriptId, originalSource, true);
 
           const lyricResult = await Promise.race([lyricPromise, new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))]);
+
+          // 计入 share usage（分享者自己调用也计数）
+          await incrementShareUsage(env?.DB);
 
           return jsonResponse({
             url: result.data.url, type: result.data.type || body.quality, source: originalSource,
@@ -517,18 +500,32 @@ async function handleGetMusicUrl(request: Request, storage: ScriptStorage): Prom
         if (allowToggleSource) {
           console.log(`[API] 🔄 调用 tryToggleSourceInternal (原始源: ${originalSource})`);
           const elapsedMs = responseTime;
-          const toggleResult = await tryToggleSourceInternal(body, songId, name, singer, originalSource, excludeSources, currentScriptId, currentScript.name, runner, storage, elapsedMs);
+          if (toggleSearchCache === null) {
+            const keyword = `${name} ${singer}`.trim();
+            const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+            const sourcesToTry = allSources.filter(s => !excludeSources.includes(s));
+            toggleSearchCache = await performToggleSearch(keyword, sourcesToTry, name, singer, body, '[ToggleSource]');
+            console.log(`[ToggleSource] 首次搜索完成，共 ${toggleSearchCache.length} 个匹配`);
+          }
+          const toggleResult = await tryToggleSourceInternal(body, songId, name, singer, originalSource, excludeSources, currentScriptId, currentScript.name, runner, storage, elapsedMs, toggleSearchCache);
           if (toggleResult.success && toggleResult.url) {
             console.log(`[API] ✅ tryToggleSourceInternal 换源成功: ${originalSource} -> ${toggleResult.newSource}`);
+            const toggleLyric = await Promise.race([
+              getLyricForMatchedSong(toggleResult.matchedSong),
+              new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))
+            ]);
+            await incrementShareUsage(env?.DB);
             return jsonResponse({
               url: toggleResult.url, type: toggleResult.type || body.quality, source: toggleResult.newSource,
-              quality: body.quality, lyric: '', cached: false,
-              fallback: { toggled: true, originalSource, newSource: toggleResult.newSource, matchedSong: { name: toggleResult.matchedName, singer: toggleResult.matchedSinger } },
-              scriptId: currentScriptId, scriptName: currentScript.name,
-              triedScripts: triedScripts.length > 0 ? triedScripts : undefined,
-            }, 200, '获取成功（换源）');
-          }
-          console.log(`[API] tryToggleSourceInternal 失败: ${toggleResult.message}`);
+              quality: body.quality, lyric: toggleLyric.lyric, tlyric: toggleLyric.tlyric, rlyric: toggleLyric.rlyric, lxlyric: toggleLyric.lxlyric, cached: false,
+fallback: { toggled: true, originalSource, newSource: toggleResult.newSource, matchedSong: toggleResult.matchedSong || { name: toggleResult.matchedName, singer: toggleResult.matchedSinger } },
+scriptId: currentScriptId, scriptName: currentScript.name,
+triedScripts: triedScripts.length > 0 ? triedScripts : undefined,
+}, 200, '获取成功（换源）');
+}
+// 换源成功也计入 share usage
+await incrementShareUsage(env?.DB);
+console.log(`[API] tryToggleSourceInternal 失败: ${toggleResult.message}`);
         } else {
           console.log(`[API] 换源已禁用(allowToggleSource=false)`);
         }
@@ -609,6 +606,8 @@ async function handleForceToggle(
   const toggleSources = ['kw', 'kg', 'tx', 'wy', 'mg'].filter(s => s !== originalSource && !excludeSources.includes(s));
   console.log(`[ForceToggle] 原始源 ${originalSource} 无脚本，尝试: [${toggleSources.join(',')}]`);
   const forceToggleLogs: string[] = [];
+  // 预先启动歌词获取（使用原始源，因为新源的 songId 可能不正确）
+  const ftLyricPromise = getLyricForMusicUrl(body, songId, name, singer, originalSource);
 
   for (const trySource of toggleSources) {
     for (const s of allScripts) {
@@ -629,7 +628,9 @@ async function handleForceToggle(
           if (fastUrl) {
             await storage.updateScriptStats(s.id, true, 0);
             await storage.recordScriptSuccess(s.id);
-            return jsonResponse({ url: fastUrl, type: body.quality, source: trySource, quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: trySource }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（快速换源）');
+            await incrementShareUsage(env?.DB);
+const ftLyric = await Promise.race([ftLyricPromise, new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))]);
+return jsonResponse({ url: fastUrl, type: body.quality, source: trySource, quality: body.quality, lyric: ftLyric.lyric, tlyric: ftLyric.tlyric, rlyric: ftLyric.rlyric, lxlyric: ftLyric.lxlyric, cached: false, fallback: { toggled: true, originalSource, newSource: trySource }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（快速换源）');
           }
         } catch (fe: any) {
           console.log(`[ForceToggle] ⚡ 快速路径失败: ${fe.message?.substring(0, 100)}, 回退到完整路径...`);
@@ -649,9 +650,11 @@ async function handleForceToggle(
         if (result.data.url) {
           await storage.updateScriptStats(s.id, true, 0);
           await storage.recordScriptSuccess(s.id);
-          return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: trySource, quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: trySource }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源）');
-        }
-        forceToggleLogs.push(`${s.name}+${trySource}: url为空`);
+await incrementShareUsage(env?.DB);
+const ftLyric = await Promise.race([ftLyricPromise, new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))]);
+return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: trySource, quality: body.quality, lyric: ftLyric.lyric, tlyric: ftLyric.tlyric, rlyric: ftLyric.rlyric, lxlyric: ftLyric.lxlyric, cached: false, fallback: { toggled: true, originalSource, newSource: trySource }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源）');
+}
+forceToggleLogs.push(`${s.name}+${trySource}: url为空`);
       } catch (ftErr: any) {
         console.log(`[ForceToggle] ❌ ${s.name}+${trySource} 异常: ${ftErr.message?.substring(0, 120)}`);
         const diag = runner.getDiagnostics ? runner.getDiagnostics() : null;
@@ -676,7 +679,9 @@ async function handleForceToggle(
         await storage.updateScriptStats(s.id, true, degradeResponseTime);
         await storage.recordScriptSuccess(s.id);
         await storage.updateSourceStats(s.id, 'wy', true);
-        return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'wy', quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: 'wy' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
+        await incrementShareUsage(env?.DB);
+const ftLyric = await Promise.race([ftLyricPromise, new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))]);
+return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'wy', quality: body.quality, lyric: ftLyric.lyric, tlyric: ftLyric.tlyric, rlyric: ftLyric.rlyric, lxlyric: ftLyric.lxlyric, cached: false, fallback: { toggled: true, originalSource, newSource: 'wy' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
       }
       await storage.updateScriptStats(s.id, false, degradeResponseTime);
       await storage.updateSourceStats(s.id, 'wy', false);
@@ -709,7 +714,9 @@ async function handleForceToggle(
         await storage.updateScriptStats(s.id, true, degradeResponseTime);
         await storage.recordScriptSuccess(s.id);
         await storage.updateSourceStats(s.id, 'kw', true);
-        return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'kw', quality: body.quality, lyric: '', cached: false, fallback: { toggled: true, originalSource, newSource: 'kw' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
+        await incrementShareUsage(env?.DB);
+const ftLyric = await Promise.race([ftLyricPromise, new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))]);
+return jsonResponse({ url: result.data.url, type: result.data.type || body.quality, source: 'kw', quality: body.quality, lyric: ftLyric.lyric, tlyric: ftLyric.tlyric, rlyric: ftLyric.rlyric, lxlyric: ftLyric.lxlyric, cached: false, fallback: { toggled: true, originalSource, newSource: 'kw' }, scriptId: s.id, scriptName: s.name }, 200, '获取成功（强制换源-降级）');
       }
       await storage.updateScriptStats(s.id, false, degradeResponseTime);
       await storage.updateSourceStats(s.id, 'kw', false);
@@ -728,7 +735,7 @@ async function handleForceToggle(
     } finally { /* 不 dispose — runner 被缓存复用 */ }
   }
 
-  return jsonResponse(null, 500, `没有支持 ${originalSource} 源的脚本且换源失败`, { source: originalSource, forceToggleLogs });
+  return jsonResponse(null, 412, `没有支持 ${originalSource} 源的脚本且换源失败`);
 }
 
 // ==================== 换源逻辑 ====================
@@ -740,24 +747,19 @@ interface ToggleResult {
   newSource?: string;
   matchedName?: string;
   matchedSinger?: string;
+  matchedSong?: any;
   message: string;
 }
 
-async function tryToggleSourceInternal(
-  body: any, songId: string, name: string, singer: string,
-  originalSource: string, excludeSources: string[],
-  scriptId: string, scriptName: string, runner: ScriptRunner,
-  storage: ScriptStorage, elapsedMs: number
-): Promise<ToggleResult> {
-  console.log(`[ToggleSource] === 函数被调用! originalSource=${originalSource}, name=${name}, singer=${singer}, songId=${songId} ===`);
-  const keyword = `${name} ${singer}`.trim();
-  const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
-  const sourcesToTry = allSources.filter(s => s !== originalSource && !excludeSources.includes(s));
-  if (sourcesToTry.length === 0) return { success: false, message: '没有可用的换源源' };
-
-  console.log(`[ToggleSource] 开始换源: "${keyword}", 原始源: ${originalSource}, 候选: [${sourcesToTry.join(',')}], 已耗时: ${elapsedMs}ms`);
-
-  // 策略1：先尝试搜索匹配（精确）
+/**
+ * 执行换源搜索（一次请求只调用一次，结果缓存复用）
+ * 对所有候选源并行搜索，按歌名+歌手精确匹配最佳结果。
+ */
+async function performToggleSearch(
+  keyword: string, sourcesToTry: string[],
+  name: string, singer: string, body: any,
+  logPrefix: string = '[ToggleSearch]'
+): Promise<any[]> {
   let matchedSongs: any[] = [];
   try {
     const searchPromises = sourcesToTry.map(async (source) => {
@@ -771,25 +773,56 @@ async function tryToggleSourceInternal(
     for (const { source, results } of searchResultsArray) {
       if (results.length === 0 || (results.length === 1 && !results[0].name)) continue;
       const matched = findBestMatch(results, name, singer, body.interval || body.musicInfo?.interval, body.albumName || body.musicInfo?.albumName || body.musicInfo?.album || '');
-      if (matched) { matchedSongs.push({ ...matched, source }); console.log(`[ToggleSource] 搜索匹配 ${source}: ${matched.name} - ${matched.singer} (${(matched.matchScore || 0).toFixed(2)})`); }
+      if (matched) { matchedSongs.push({ ...matched, source }); console.log(`${logPrefix} 搜索匹配 ${source}: ${matched.name} - ${matched.singer} (${(matched.matchScore || 0).toFixed(2)})`); }
     }
-  } catch (e: any) { console.log(`[ToggleSource] 搜索阶段异常: ${e.message}`); }
+  } catch (e: any) { console.log(`${logPrefix} 搜索阶段异常: ${e.message}`); }
+  return matchedSongs;
+}
+
+async function tryToggleSourceInternal(
+  body: any, songId: string, name: string, singer: string,
+  originalSource: string, excludeSources: string[],
+  scriptId: string, scriptName: string, runner: ScriptRunner,
+  storage: ScriptStorage, elapsedMs: number,
+  matchedSongs: any[]
+): Promise<ToggleResult> {
+  console.log(`[ToggleSource] === 函数被调用! originalSource=${originalSource}, name=${name}, singer=${singer}, songId=${songId} ===`);
+  const keyword = `${name} ${singer}`.trim();
+  const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+  // 关键修复：换源时也包含原始源！因为原始 songId 可能是错误的（如过期/跨平台ID），
+  // 通过搜索按歌名+歌手可以在原始源上找到正确的 songId。
+  // 例如：kw 原始 ID 667425914 是错误的，但搜索 "1206 Edan 吕爵安" 能找到正确 ID 573061660。
+  const sourcesToTry = allSources.filter(s => !excludeSources.includes(s));
+  if (sourcesToTry.length === 0) return { success: false, message: '没有可用的换源源' };
+
+  console.log(`[ToggleSource] 开始换源: "${keyword}", 原始源: ${originalSource}, 候选(含原始源搜索): [${sourcesToTry.join(',')}], 已耗时: ${elapsedMs}ms, 搜索结果: ${matchedSongs.length}个匹配`);
+
+  // 使用传入的搜索结果（已缓存，避免重复搜索）
+  let songsToTry = matchedSongs;
 
   // 策略2：搜索无结果时，直接用原歌曲信息重试其他源（适用于聚合脚本如juhe）
-  if (matchedSongs.length === 0) {
+  // 注意：策略2排除原始源，因为用原始 songId 在原始源上已经失败了，重试无意义
+  if (songsToTry.length === 0) {
     console.log('[ToggleSource] 搜索未找到匹配，切换到直接重试模式（用原歌曲信息尝试所有候选源）');
-    for (const src of sourcesToTry) {
-      matchedSongs.push({ name, singer, source: src, songmid: songId || '', id: songId || '', hash: songId || '', interval: body.interval || body.musicInfo?.interval || '', albumName: body.albumName || body.musicInfo?.albumName || '', picUrl: body.picUrl || '', musicInfo: { name, singer, source: src, songmid: songId }, matchScore: 0.5 });
+    songsToTry = [];
+    const fallbackSources = sourcesToTry.filter(s => s !== originalSource);
+    for (const src of fallbackSources) {
+      songsToTry.push({ name, singer, source: src, songmid: songId || '', id: songId || '', hash: songId || '', interval: body.interval || body.musicInfo?.interval || '', albumName: body.albumName || body.musicInfo?.albumName || '', picUrl: body.picUrl || '', musicInfo: { name, singer, source: src, songmid: songId }, matchScore: 0.5 });
     }
   }
 
   // 按匹配度和成功率排序
   const sourceStats = await storage.getSourceStats();
-  const sortedSongs = sortByMatchAndSuccessRate(matchedSongs, sourceStats[scriptId] || {});
+  const sortedSongs = sortByMatchAndSuccessRate(songsToTry, sourceStats[scriptId] || {});
 
   for (const song of sortedSongs) {
     const newSource = song.source;
     const newSongId = song.musicInfo?.songmid || song.songmid || song.id || song.hash;
+    // 跳过与原始请求完全相同的源+ID组合（已经试过且失败了）
+    if (newSource === originalSource && newSongId === songId) {
+      console.log(`[ToggleSource] 跳过原始请求组合: ${newSource}/${newSongId}（已失败）`);
+      continue;
+    }
     console.log(`[ToggleSource] 尝试 ${newSource} (songId: ${newSongId || '(原)'})`);
 
     try {
@@ -799,13 +832,32 @@ async function tryToggleSourceInternal(
           songmid: newSongId || songId, interval: song.interval || '',
           meta: { songId: newSongId || songId },
           albumName: song.albumName || '', img: song.picUrl || '' }},
+        timeoutMs: 8000,
       });
 
       if (result.data.url) {
+        // 检查黑名单 URL（与主流程一致）
+        if (result.data.url.endsWith('2149972737147268278.mp3')) {
+          console.log(`[ToggleSource] ⚠️ ${newSource} 返回黑名单URL，跳过`);
+          await storage.updateSourceStats(scriptId, newSource, false);
+          continue;
+        }
         await storage.updateSourceStats(scriptId, newSource, true);
         await storage.updateScriptStats(scriptId, true, 0);
         await storage.recordScriptSuccess(scriptId);
-        return { success: true, url: result.data.url, type: result.data.type, newSource, matchedName: song.name, matchedSinger: song.singer, message: 'ok' };
+        return { success: true, url: result.data.url, type: result.data.type, newSource, matchedName: song.name, matchedSinger: song.singer,
+          matchedSong: {
+            id: song.musicInfo?.songmid || song.songmid || song.id || song.hash || '',
+            songmid: song.musicInfo?.songmid || song.songmid || song.id || '',
+            hash: song.musicInfo?.hash || song.hash || '',
+            copyrightId: song.musicInfo?.copyrightId || song.copyrightId || '',
+            name: song.name,
+            singer: song.singer,
+            source: newSource,
+            interval: song.interval || '',
+            albumName: song.albumName || song.album || '',
+          },
+          message: 'ok' };
       }
       await storage.updateSourceStats(scriptId, newSource, false);
     } catch (e: any) {
@@ -895,16 +947,667 @@ async function getLyricForMusicUrl(body: any, songId: string, name: string, sing
   } catch (_e) { return { lyric: '', tlyric: '', rlyric: '', lxlyric: '' }; }
 }
 
+/**
+ * 根据换源后的 matchedSong 获取歌词
+ * matchedSong 包含新源的 source、songmid、hash、copyrightId 等正确信息。
+ * 不同源使用不同的 ID 字段获取歌词：
+ *   kw → songmid, kg → hash, tx/wy → songId, mg → copyrightId
+ */
+async function getLyricForMatchedSong(matchedSong: any): Promise<{ lyric: string; tlyric: string; rlyric: string; lxlyric: string }> {
+  if (!matchedSong || !matchedSong.source) return { lyric: '', tlyric: '', rlyric: '', lxlyric: '' };
+  try {
+    const source = matchedSong.source;
+    const musicInfo: any = { source };
+    switch (source) {
+      case 'kw':
+        musicInfo.songmid = matchedSong.songmid || matchedSong.id || '';
+        break;
+      case 'kg':
+        musicInfo.hash = matchedSong.hash || matchedSong.id || '';
+        musicInfo.name = matchedSong.name || '';
+        break;
+      case 'tx':
+        musicInfo.songId = matchedSong.id || matchedSong.songmid || '';
+        break;
+      case 'wy':
+        musicInfo.songId = matchedSong.id || matchedSong.songmid || '';
+        break;
+      case 'mg':
+        musicInfo.copyrightId = matchedSong.copyrightId || matchedSong.id || '';
+        musicInfo.name = matchedSong.name || '';
+        musicInfo.singer = matchedSong.singer || '';
+        break;
+      default:
+        return { lyric: '', tlyric: '', rlyric: '', lxlyric: '' };
+    }
+    const result = await lyricService.getLyric(musicInfo);
+    return { lyric: result.lyric || '', tlyric: result.tlyric || '', rlyric: result.rlyric || '', lxlyric: result.lxlyric || '' };
+  } catch (_e) { return { lyric: '', tlyric: '', rlyric: '', lxlyric: '' }; }
+}
+
+// ==================== inline 脚本换源（无需 storage） ====================
+
+/**
+ * 为 inline 脚本执行换源逻辑（不依赖 ScriptStorage 统计）
+ *
+ * 流程与 tryToggleSourceInternal 一致，但跳过所有 storage 统计更新。
+ * 适用于 /share/music-url 中客户端传入的脚本。
+ */
+async function tryToggleSourceForInline(
+  body: any, songId: string, name: string, singer: string,
+  originalSource: string, excludeSources: string[],
+  scriptId: string, scriptName: string, runner: ScriptRunner,
+  elapsedMs: number,
+  matchedSongs: any[]
+): Promise<ToggleResult> {
+  console.log(`[ShareToggle] === inline换源 originalSource=${originalSource}, name=${name}, singer=${singer}, songId=${songId} ===`);
+  const keyword = `${name} ${singer}`.trim();
+  const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+  // 关键修复：换源时也包含原始源！原始 songId 可能是错误的，
+  // 通过搜索按歌名+歌手可以在原始源上找到正确的 songId。
+  const sourcesToTry = allSources.filter(s => !excludeSources.includes(s));
+  if (sourcesToTry.length === 0) return { success: false, message: '没有可用的换源源' };
+
+  console.log(`[ShareToggle] 开始换源: "${keyword}", 原始源: ${originalSource}, 候选(含原始源搜索): [${sourcesToTry.join(',')}], 已耗时: ${elapsedMs}ms, 搜索结果: ${matchedSongs.length}个匹配`);
+
+  // 使用传入的搜索结果（已缓存，避免重复搜索）
+  let songsToTry = matchedSongs;
+
+  // 策略2：搜索无结果时，直接用原歌曲信息重试其他源（适用于聚合脚本如juhe）
+  // 注意：策略2排除原始源，因为用原始 songId 在原始源上已经失败了，重试无意义
+  if (songsToTry.length === 0) {
+    console.log('[ShareToggle] 搜索未找到匹配，切换到直接重试模式（用原歌曲信息尝试所有候选源）');
+    songsToTry = [];
+    const fallbackSources = sourcesToTry.filter(s => s !== originalSource);
+    for (const src of fallbackSources) {
+      songsToTry.push({ name, singer, source: src, songmid: songId || '', id: songId || '', hash: songId || '', interval: body.interval || body.musicInfo?.interval || '', albumName: body.albumName || body.musicInfo?.albumName || '', picUrl: body.picUrl || '', musicInfo: { name, singer, source: src, songmid: songId }, matchScore: 0.5 });
+    }
+  }
+
+  // 排序（inline 脚本无历史统计，使用空统计）
+  const sortedSongs = sortByMatchAndSuccessRate(songsToTry, {});
+
+  for (const song of sortedSongs) {
+    const newSource = song.source;
+    const newSongId = song.musicInfo?.songmid || song.songmid || song.id || song.hash;
+    // 跳过与原始请求完全相同的源+ID组合（已经试过且失败了）
+    if (newSource === originalSource && newSongId === songId) {
+      console.log(`[ShareToggle] 跳过原始请求组合: ${newSource}/${newSongId}（已失败）`);
+      continue;
+    }
+    console.log(`[ShareToggle] 尝试 ${newSource} (songId: ${newSongId || '(原)'})`);
+
+    try {
+      const result = await runner.request({
+        source: newSource, action: 'musicUrl',
+        info: { type: body.quality, musicInfo: { id: newSongId || songId, name: song.name, singer: song.singer, source: newSource,
+          songmid: newSongId || songId, interval: song.interval || '',
+          meta: { songId: newSongId || songId },
+          albumName: song.albumName || '', img: song.picUrl || '' }},
+        timeoutMs: 8000,
+      });
+
+      if (result.data.url) {
+        // 检查黑名单 URL（与主流程一致）
+        if (result.data.url.endsWith('2149972737147268278.mp3')) {
+          console.log(`[ShareToggle] ⚠️ ${newSource} 返回黑名单URL，跳过`);
+          continue;
+        }
+        console.log(`[ShareToggle] ✅ 换源成功: ${originalSource} -> ${newSource}`);
+        return { success: true, url: result.data.url, type: result.data.type, newSource, matchedName: song.name, matchedSinger: song.singer,
+          matchedSong: {
+            id: song.musicInfo?.songmid || song.songmid || song.id || song.hash || '',
+            songmid: song.musicInfo?.songmid || song.songmid || song.id || '',
+            hash: song.musicInfo?.hash || song.hash || '',
+            copyrightId: song.musicInfo?.copyrightId || song.copyrightId || '',
+            name: song.name,
+            singer: song.singer,
+            source: newSource,
+            interval: song.interval || '',
+            albumName: song.albumName || song.album || '',
+          },
+          message: 'ok' };
+      }
+    } catch (e: any) {
+      console.log(`[ShareToggle] ${newSource} 异常: ${e.message}`);
+    }
+  }
+
+  return { success: false, message: '所有音源均获取失败' };
+}
+
+// ==================== Share Plan Functions ====================
+// PUBLIC_KEY 由环境变量独立配置，不再从 OWNER_KEY 计算
+// sha256Hex 保留供未来扩展使用
+async function sha256Hex(text: string): Promise<string> {
+  const data = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ==================== 统一 app_data 存储（委托 AppDataStore） ====================
+// 所有读写通过 AppDataStore 串行化，避免竞态；JSON 损坏时拒绝覆盖（方案 C+D）。
+// 数据结构合并：scriptStats+sourceStats → script_stats, share_usage+api_calls → usage
+
+let _appDataStore: AppDataStore | null = null;
+function getStore(db: D1Database): AppDataStore {
+  if (!_appDataStore || _appDataStore.isCorrupted()) {
+    _appDataStore = new AppDataStore(db);
+  }
+  return _appDataStore;
+}
+
+async function getAppData(db: D1Database): Promise<AppData> {
+  return getStore(db).get();
+}
+
+async function getShareConfig(db: D1Database): Promise<ShareConfig> {
+  const data = await getAppData(db);
+  return data.share_config;
+}
+
+async function setShareConfig(db: D1Database, config: ShareConfig): Promise<void> {
+  await getStore(db).update(data => {
+    data.share_config = config;
+  });
+}
+
+async function getShareUsage(db: D1Database): Promise<{ date: string; count: number }> {
+  const today = getTodayDateString();
+  const data = await getAppData(db);
+  return { date: today, count: data.usage.daily[today]?.share || 0 };
+}
+
+// 统一的计数器递增（通过 AppDataStore 串行化，无竞态）
+async function incrementCounters(db: D1Database, incrementShare: boolean = false): Promise<number> {
+  if (!db) return 0;
+  const today = getTodayDateString();
+  try {
+    await getStore(db).update(data => {
+      const entry = data.usage.daily[today] || { share: 0, api: 0 };
+      entry.api += 1;
+      data.usage.api_total += 1;
+      if (incrementShare) {
+        entry.share += 1;
+      }
+      data.usage.daily[today] = entry;
+      cleanupUsageDaily(data);
+    });
+  } catch (e: any) {
+    console.error("[incrementCounters] update failed:", e.message);
+  }
+  const data = await getAppData(db);
+  return data.usage.daily[today]?.share || 0;
+}
+
+async function getApiCallStats(db: D1Database): Promise<Array<{ date: string; count: number }>> {
+  const result: Array<{ date: string; count: number }> = [];
+  const data = await getAppData(db);
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    result.push({ date: d, count: data.usage.daily[d]?.api || 0 });
+  }
+  return result;
+}
+
+// 仅递增 share_usage 和 share_usage_total（通过 AppDataStore 串行化）
+async function incrementShareUsage(db?: D1Database): Promise<number> {
+  if (!db) return 0;
+  const today = getTodayDateString();
+  await getStore(db).update(data => {
+    const entry = data.usage.daily[today] || { share: 0, api: 0 };
+    entry.share += 1;
+    data.usage.share_total += 1;
+    data.usage.daily[today] = entry;
+    cleanupUsageDaily(data);
+  });
+  const data = await getAppData(db);
+  return data.usage.daily[today]?.share || 0;
+}
+
+async function handleShareStatus(request: Request, env: Env): Promise<Response> {
+  let appData: AppData;
+  try {
+    appData = await getAppData(env.DB);
+  } catch (e: any) {
+    console.error("[handleShareStatus] getAppData failed, using defaults:", e.message);
+    appData = defaultAppData();
+  }
+  const config = appData.share_config;
+  const today = getTodayDateString();
+  const usageCount = appData.usage.daily[today]?.share || 0;
+  const pubKey = env.PUBLIC_KEY || "";
+  return jsonResponse({
+    status: "ok",
+    serverVersion: SERVER_VERSION,
+    serverVersionCode: SERVER_VERSION_CODE,
+    platform: SERVER_PLATFORM,
+    minClientVersion: MIN_CLIENT_VERSION,
+    minClientVersionCode: MIN_CLIENT_VERSION_CODE,
+    public_key: pubKey,
+    share_status: config.status,
+    node_id: config.node_id || "",
+    daily_limit: config.daily_limit,
+    current_usage: usageCount,
+    remaining: Math.max(0, config.daily_limit - usageCount),
+    service: "cf-phg-music-server",
+  });
+}
+
+async function handleOwnerStatus(request: Request, env: Env): Promise<Response> {
+let data: AppData;
+try {
+  data = await getAppData(env.DB);
+} catch (e: any) {
+  console.error("[handleOwnerStatus] getAppData failed, using defaults:", e.message);
+  data = defaultAppData();
+}
+const config = data.share_config;
+const today = getTodayDateString();
+const usageCount = data.usage.daily[today]?.share || 0;
+const pubKey = env.PUBLIC_KEY || "";
+// 构建7天趋势（使用 usage.daily 中的 api 计数，与 api_call_total 一致）
+const apiCallStats: Array<{ date: string; count: number }> = [];
+for (let i = 6; i >= 0; i--) {
+  const d = new Date(Date.now() - i * 24 * 3600 * 1000).toISOString().slice(0, 10);
+  apiCallStats.push({ date: d, count: data.usage.daily[d]?.api || 0 });
+}
+return jsonResponse({
+status: "ok",
+serverVersion: SERVER_VERSION,
+serverVersionCode: SERVER_VERSION_CODE,
+platform: SERVER_PLATFORM,
+minClientVersion: MIN_CLIENT_VERSION,
+minClientVersionCode: MIN_CLIENT_VERSION_CODE,
+public_key: pubKey,
+share_status: config.status,
+node_id: config.node_id || "",
+daily_limit: config.daily_limit,
+reserved_limit: config.reserved_limit,
+current_usage: usageCount,
+contributor_name: config.contributor_name,
+remaining: Math.max(0, config.daily_limit - usageCount),
+api_call_stats: apiCallStats,
+api_call_total: data.usage.api_total || 0,
+shared_since: config.shared_since || 0,
+});
+}
+
+async function handleShareMusicUrl(request: Request, env: Env): Promise<Response> {
+  try {
+  const appData = await getAppData(env.DB);
+  const config = appData.share_config;
+  if (config.status !== 1) return jsonResponse(null, 403, "share mode is disabled");
+  const today = getTodayDateString();
+  const usageCount = appData.usage.daily[today]?.share || 0;
+  if (usageCount >= config.daily_limit) return jsonResponse(null, 429, "daily share limit reached");
+  const body = await request.json() as any;
+  if (!body.source || !body.quality) return jsonResponse(null, 400, "missing: source, quality");
+  const musicInfo = body.musicInfo || {};
+  const songId = body.songmid || body.id || body.songId || musicInfo?.id || musicInfo?.songmid || "";
+  const name = body.name || musicInfo?.name || '未知歌曲';
+  const singer = body.singer || musicInfo?.singer || '未知歌手';
+  const originalSource = body.source;
+
+  // 换源控制参数（与 /api/music/url 一致）
+  const allowToggleSource = body.allowToggleSource !== false;
+  const excludeSources = body.excludeSources || [];
+
+  // 预先启动歌词获取（并行）
+  let lyricPromise = getLyricForMusicUrl(body, songId, name, singer, originalSource);
+
+  // 统一构建 inline 脚本列表（兼容旧版单个 scriptContent 和新版 scripts 数组）
+  const inlineScripts: { id: string; name: string; rawScript: string; isDefault?: boolean }[] = [];
+  if (body.scripts && Array.isArray(body.scripts)) {
+    // 新模式：多脚本数组
+    for (const s of body.scripts) {
+      if (!s.content) continue;
+      let raw = s.content;
+      try { raw = atob(raw); } catch (_e) {}
+      inlineScripts.push({
+        id: "share_inline_" + simpleHash(raw),
+        name: s.name || 'Share Script',
+        rawScript: raw,
+        isDefault: s.isDefault === true,
+      });
+    }
+  } else if (body.scriptContent) {
+    // 向后兼容：单个脚本
+    let raw = body.scriptContent;
+    try { raw = atob(raw); } catch (_e) {}
+    inlineScripts.push({
+      id: "share_inline_" + simpleHash(raw),
+      name: body.scriptName || 'Share Script',
+      rawScript: raw,
+      isDefault: true,
+    });
+  }
+
+  // 按默认脚本优先排序（与 /api/music/url 的 getSortedScriptsBySuccessRate 一致）
+  if (inlineScripts.length > 1) {
+    inlineScripts.sort((a, b) => {
+      if (a.isDefault && !b.isDefault) return -1;
+      if (!a.isDefault && b.isDefault) return 1;
+      return 0;
+    });
+    console.log(`[ShareMusicUrl] 脚本排序: ${inlineScripts.map(s => `${s.name}${s.isDefault ? '(默认)' : ''}`).join(' → ')}`);
+  }
+
+  let resultUrl: string | null = null;
+  let resultType: string = body.quality;
+  let resultSource: string = body.source;
+  let resultScriptId = 'share_inline';
+  let resultScriptName = body.scriptName || 'Share Script';
+  let resultFallback: any = { toggled: false, originalSource };
+  const triedScripts: { scriptId: string; scriptName: string; message: string; responseTime: number }[] = [];
+  // 换源搜索缓存：一次请求只搜索一次，后续换源复用结果
+  let toggleSearchCache: any[] | null = null;
+
+  // ===== 模式1：使用客户端提供的 inline 脚本（支持多脚本 + 换源 + 换脚本） =====
+  if (inlineScripts.length > 0) {
+    // 根据脚本数量动态分配超时（与 /api/music/url 一致）
+    const scriptCount = inlineScripts.length;
+    const perScriptTimeout = scriptCount === 1 ? 15000 : scriptCount === 2 ? 7300 : 4300;
+    console.log(`[ShareMusicUrl] 模式1: ${scriptCount}个 inline 脚本, 每脚本超时 ${perScriptTimeout}ms, 换源=${allowToggleSource}`);
+
+    for (const scriptInfo of inlineScripts) {
+      let runner: ScriptRunner;
+      try {
+        runner = await getOrCreateRunner(scriptInfo);
+      } catch (initErr: any) {
+        console.error(`[ShareMusicUrl] 脚本 ${scriptInfo.name} 初始化失败:`, initErr.message);
+        triedScripts.push({ scriptId: scriptInfo.id, scriptName: scriptInfo.name, message: '初始化失败: ' + (initErr.message || 'unknown'), responseTime: 0 });
+        continue;  // 换下一个脚本（换脚本）
+      }
+
+      const startTime = Date.now();
+      try {
+        const result = await runner.request({
+          source: body.source, action: "musicUrl",
+          info: { type: body.quality, musicInfo: { id: songId, name: musicInfo?.name || "", singer: musicInfo?.singer || "", source: body.source, songmid: songId, interval: musicInfo?.interval || 0, meta: { songId, hash: musicInfo?.hash || "", copyrightId: musicInfo?.copyrightId || "" }, typeUrl: {}, types: musicInfo?.types || [], _types: {}, hash: musicInfo?.hash || "", copyrightId: musicInfo?.copyrightId || "", strMediaMid: musicInfo?.strMediaMid || "", albumId: musicInfo?.albumId || "", songId: musicInfo?.songId || songId, lrcUrl: "", mrcUrl: "", trcUrl: "" } },
+          timeoutMs: perScriptTimeout,
+        });
+        const responseTime = Date.now() - startTime;
+
+        if (result.data.url) {
+          // 黑名单URL检查
+          if (result.data.url.endsWith('2149972737147268278.mp3')) {
+            console.log(`[ShareMusicUrl] ⚠️ 脚本 ${scriptInfo.name} 返回黑名单URL，触发换源`);
+            triedScripts.push({ scriptId: scriptInfo.id, scriptName: scriptInfo.name, message: '黑名单URL', responseTime });
+
+            if (allowToggleSource) {
+              if (toggleSearchCache === null) {
+                const keyword = `${name} ${singer}`.trim();
+                const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+                const sourcesToTry = allSources.filter(s => !excludeSources.includes(s));
+                toggleSearchCache = await performToggleSearch(keyword, sourcesToTry, name, singer, body, '[ShareToggle]');
+                console.log(`[ShareToggle] 首次搜索完成，共 ${toggleSearchCache.length} 个匹配`);
+              }
+              const toggleResult = await tryToggleSourceForInline(body, songId, name, singer, originalSource, excludeSources, scriptInfo.id, scriptInfo.name, runner, responseTime, toggleSearchCache);
+              if (toggleResult.success && toggleResult.url) {
+                resultUrl = toggleResult.url;
+                resultType = toggleResult.type || body.quality;
+                resultSource = toggleResult.newSource || originalSource;
+                resultScriptId = scriptInfo.id;
+                resultScriptName = scriptInfo.name;
+resultFallback = { toggled: true, originalSource, newSource: toggleResult.newSource, matchedSong: toggleResult.matchedSong || { name: toggleResult.matchedName, singer: toggleResult.matchedSinger } };
+lyricPromise = getLyricForMatchedSong(toggleResult.matchedSong);
+break;
+}
+}
+continue;  // 换下一个脚本
+          }
+
+          // 成功获取URL
+          resultUrl = result.data.url;
+          resultType = result.data.type || body.quality;
+          resultSource = body.source;
+          resultScriptId = scriptInfo.id;
+          resultScriptName = scriptInfo.name;
+          break;
+        }
+
+        // URL为空，尝试换源
+        triedScripts.push({ scriptId: scriptInfo.id, scriptName: scriptInfo.name, message: 'URL为空', responseTime });
+        if (allowToggleSource) {
+          console.log(`[ShareMusicUrl] 脚本 ${scriptInfo.name} URL为空，触发换源`);
+          if (toggleSearchCache === null) {
+            const keyword = `${name} ${singer}`.trim();
+            const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+            const sourcesToTry = allSources.filter(s => !excludeSources.includes(s));
+            toggleSearchCache = await performToggleSearch(keyword, sourcesToTry, name, singer, body, '[ShareToggle]');
+            console.log(`[ShareToggle] 首次搜索完成，共 ${toggleSearchCache.length} 个匹配`);
+          }
+          const toggleResult = await tryToggleSourceForInline(body, songId, name, singer, originalSource, excludeSources, scriptInfo.id, scriptInfo.name, runner, responseTime, toggleSearchCache);
+          if (toggleResult.success && toggleResult.url) {
+            resultUrl = toggleResult.url;
+            resultType = toggleResult.type || body.quality;
+            resultSource = toggleResult.newSource || originalSource;
+            resultScriptId = scriptInfo.id;
+            resultScriptName = scriptInfo.name;
+resultFallback = { toggled: true, originalSource, newSource: toggleResult.newSource, matchedSong: toggleResult.matchedSong || { name: toggleResult.matchedName, singer: toggleResult.matchedSinger } };
+lyricPromise = getLyricForMatchedSong(toggleResult.matchedSong);
+break;
+}
+}
+} catch (error: any) {
+        const responseTime = Date.now() - startTime;
+        triedScripts.push({ scriptId: scriptInfo.id, scriptName: scriptInfo.name, message: error.message || '未知错误', responseTime });
+        console.log(`[ShareMusicUrl] ❌ 脚本 ${scriptInfo.name} 失败: ${error.message}, 耗时: ${responseTime}ms`);
+
+        if (allowToggleSource) {
+          console.log(`[ShareMusicUrl] 脚本 ${scriptInfo.name} 异常，触发换源`);
+          if (toggleSearchCache === null) {
+            const keyword = `${name} ${singer}`.trim();
+            const allSources = ['kw', 'kg', 'tx', 'wy', 'mg'];
+            const sourcesToTry = allSources.filter(s => !excludeSources.includes(s));
+            toggleSearchCache = await performToggleSearch(keyword, sourcesToTry, name, singer, body, '[ShareToggle]');
+            console.log(`[ShareToggle] 首次搜索完成，共 ${toggleSearchCache.length} 个匹配`);
+          }
+          const toggleResult = await tryToggleSourceForInline(body, songId, name, singer, originalSource, excludeSources, scriptInfo.id, scriptInfo.name, runner, responseTime, toggleSearchCache);
+          if (toggleResult.success && toggleResult.url) {
+            resultUrl = toggleResult.url;
+            resultType = toggleResult.type || body.quality;
+            resultSource = toggleResult.newSource || originalSource;
+            resultScriptId = scriptInfo.id;
+            resultScriptName = scriptInfo.name;
+resultFallback = { toggled: true, originalSource, newSource: toggleResult.newSource, matchedSong: toggleResult.matchedSong || { name: toggleResult.matchedName, singer: toggleResult.matchedSinger } };
+lyricPromise = getLyricForMatchedSong(toggleResult.matchedSong);
+break;
+}
+}
+}
+// 继续下一个脚本（换脚本）
+      console.log(`[ShareMusicUrl] → 切换到下一个脚本...`);
+    }
+  }
+
+  // ===== 模式2：inline 脚本全部失败或未提供 → 使用节点自身脚本 =====
+  if (!resultUrl) {
+    if (inlineScripts.length > 0) {
+      console.log(`[ShareMusicUrl] 所有 ${inlineScripts.length} 个 inline 脚本均失败，降级使用节点脚本...`);
+    }
+    const storage = new ScriptStorage(env.DB, getStore(env.DB));
+    try {
+      const allScripts = await storage.getScripts();
+      let availableScriptIds: string[] = [];
+      for (const s of allScripts) {
+        if (s.supportedSources.includes(body.source)) {
+          const isTripped = await storage.isScriptCircuitBreakerTripped(s.id);
+          if (!isTripped) availableScriptIds.push(s.id);
+        }
+      }
+      if (availableScriptIds.length === 0) {
+        for (const s of allScripts) {
+          const isTripped = await storage.isScriptCircuitBreakerTripped(s.id);
+          if (isTripped) availableScriptIds.push(s.id);
+        }
+      }
+
+      if (availableScriptIds.length > 0) {
+        const sortedIds = await storage.getSortedScriptsBySuccessRate(availableScriptIds, (await storage.getDefaultScript())?.id ?? null);
+        const scriptTimeouts = calculateScriptTimeouts(sortedIds, sortedIds.length);
+
+        for (const currentScriptId of sortedIds) {
+          const currentScript = allScripts.find(s => s.id === currentScriptId);
+          if (!currentScript) continue;
+          let rawScript: string | null = null;
+          try { rawScript = await storage.getScriptRaw(currentScriptId); } catch (_e) {}
+          if (!rawScript) continue;
+          const runner = await getOrCreateRunner({ id: currentScriptId, name: currentScript.name, rawScript });
+          try {
+            const result = await runner.request({ source: body.source, action: "musicUrl", info: { type: body.quality, musicInfo: { id: songId, name: musicInfo?.name || "", singer: musicInfo?.singer || "", source: body.source, songmid: songId, interval: musicInfo?.interval || 0, meta: { songId, hash: musicInfo?.hash || "", copyrightId: musicInfo?.copyrightId || "" }, typeUrl: {}, types: musicInfo?.types || [], _types: {}, hash: musicInfo?.hash || "", copyrightId: musicInfo?.copyrightId || "", strMediaMid: musicInfo?.strMediaMid || "", albumId: musicInfo?.albumId || "", songId: musicInfo?.songId || songId, lrcUrl: "", mrcUrl: "", trcUrl: "" } }, timeoutMs: scriptTimeouts.get(currentScriptId) });
+            if (result.data.url) {
+              // 黑名单URL检查（与主流程一致）
+              if (result.data.url.endsWith('2149972737147268278.mp3')) {
+                console.log(`[ShareMusicUrl] ⚠️ 节点脚本 ${currentScript.name} 返回黑名单URL，跳过`);
+                await storage.updateScriptStats(currentScriptId, false, 0);
+                await storage.recordScriptFailure(currentScriptId);
+                continue;
+              }
+              resultUrl = result.data.url;
+              resultType = result.data.type || body.quality;
+              resultSource = body.source;
+              resultScriptId = currentScriptId;
+              resultScriptName = currentScript.name;
+              await storage.updateScriptStats(currentScriptId, true, 0);
+              await storage.recordScriptSuccess(currentScriptId);
+              break;
+            }
+          } catch (e: any) {
+            await storage.updateScriptStats(currentScriptId, false, 0);
+            await storage.recordScriptFailure(currentScriptId);
+          }
+        }
+        await storage.flush();
+      }
+    } catch (e: any) {
+      console.error("[ShareMusicUrl] 节点脚本执行异常:", e.message);
+    }
+  }
+
+  if (resultUrl) {
+    const newCount = await incrementShareUsage(env?.DB);
+    // 等待歌词结果（最多2秒）
+    const lyricResult = await Promise.race([lyricPromise, new Promise<any>(r => setTimeout(() => r({ lyric: '', tlyric: '', rlyric: '', lxlyric: '' }), 2000))]);
+    return jsonResponse({
+      url: resultUrl,
+      type: resultType,
+      source: resultSource,
+      quality: body.quality,
+      lyric: lyricResult.lyric || '',
+      tlyric: lyricResult.tlyric || '',
+      rlyric: lyricResult.rlyric || '',
+      lxlyric: lyricResult.lxlyric || '',
+      cached: false,
+      fallback: resultFallback,
+      scriptId: resultScriptId,
+      scriptName: resultScriptName,
+      triedScripts: triedScripts.length > 0 ? triedScripts : undefined,
+      share_info: {
+        daily_limit: config.daily_limit,
+        current_usage: newCount,
+        remaining: Math.max(0, config.daily_limit - newCount),
+        reserved_limit: config.reserved_limit,
+        contributor_name: config.contributor_name,
+      },
+    });
+  }
+  return jsonResponse(null, 500, "get music url failed", { triedScripts: triedScripts.length > 0 ? triedScripts : undefined });
+  } catch (outerError: any) {
+    console.error("[ShareMusicUrl] Unhandled error:", outerError?.message || String(outerError));
+    return jsonResponse(null, 500, "share music url error: " + (outerError?.message || "unknown"));
+  }
+}
+
+async function handleSetShareConfig(request: Request, env: Env): Promise<Response> {
+  // 鉴权通过路径 /owner/{apiKey}/share/config 完成，无需 Header
+  const body = await request.json() as any;
+  const oldConfig = await getShareConfig(env.DB);
+  const config: ShareConfig = { ...oldConfig };
+  if (body.status !== undefined) {
+    const newStatus = parseInt(body.status) === 1 ? 1 : (parseInt(body.status) === 2 ? 2 : 0);
+    // 每次开启分享(status→1)时重新生成 node_id
+    if (newStatus === 1 && config.status !== 1) {
+      config.node_id = "phg-" + crypto.randomUUID();
+      if (!config.shared_since) config.shared_since = Date.now();
+    }
+    config.status = newStatus;
+  }
+  if (body.daily_limit !== undefined) config.daily_limit = parseInt(body.daily_limit) || 50000;
+  if (body.reserved_limit !== undefined) config.reserved_limit = parseInt(body.reserved_limit) || 20000;
+  if (body.contributor_name !== undefined) config.contributor_name = String(body.contributor_name).slice(0, 50);
+  await setShareConfig(env.DB, config);
+  return jsonResponse({ success: true, config });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    // 每个请求开始时清除 AppDataStore 缓存，确保跨 isolate 读到最新 DB 数据
+    if (_appDataStore) _appDataStore.invalidateCache();
+
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders() });
 
     const apiKey = env.API_KEY || '';
-    const storage = new ScriptStorage(env.DB);
+    const storage = new ScriptStorage(env.DB, getStore(env.DB));
     const pathParts = url.pathname.split('/').filter(Boolean);
     const apiKeyInPath = pathParts[0];
+
+    // ===== Share Plan Routes =====
+    try {
+    // Owner 路由：/owner/{apiKey}/status, /owner/{apiKey}/share/config
+    if (pathParts[0] === "owner" && pathParts.length >= 3) {
+      const ownerKey = pathParts[1];
+      const subPath = pathParts[2];
+      if (ownerKey !== apiKey) return jsonResponse(null, 403, "invalid owner key");
+      if (subPath === "status" && request.method === "GET") return await handleOwnerStatus(request, env);
+      if (subPath === "share" && pathParts[3] === "config") {
+        if (request.method === "POST") return await handleSetShareConfig(request, env);
+      }
+    }
+    // Public 路由：/{publicKey}/status, /{publicKey}/share/music-url, /{publicKey}/share/config (mesh registry only sets status)
+    if (env.PUBLIC_KEY && pathParts[0] === env.PUBLIC_KEY) {
+      if (pathParts.length >= 2 && pathParts[1] === "status" && request.method === "GET") return await handleShareStatus(request, env);
+      if (pathParts.length >= 3 && pathParts[1] === "share" && pathParts[2] === "music-url" && request.method === "POST") {
+        ctx.waitUntil(incrementCounters(env.DB, false));
+        return await withTimeout(handleShareMusicUrl(request, env), REQUEST_TIMEOUT_MS);
+      }
+      // Mesh registry 踢下线：/{publicKey}/share/config POST，只允许设置 status
+      if (pathParts.length >= 3 && pathParts[1] === "share" && pathParts[2] === "config" && request.method === "POST") {
+        const body = await request.json() as any;
+        if (body.status !== undefined) {
+          // 只允许 mesh registry 设置 status=2（踢下线），不能设置其他值
+          if (parseInt(body.status) === 2) {
+            const oldConfig = await getShareConfig(env.DB);
+            const config: ShareConfig = { ...oldConfig, status: 2 };
+            await setShareConfig(env.DB, config);
+            return jsonResponse({ success: true, message: "status set to 2 (kicked offline)" });
+          }
+        }
+        return jsonResponse(null, 400, "invalid request");
+      }
+      // 公共歌单详情：/{publicKey}/share/songlist-detail POST（供免费模式客户端获取QQ音乐歌单）
+      if (pathParts.length >= 3 && pathParts[1] === "share" && pathParts[2] === "songlist-detail" && request.method === "POST") {
+        const appData = await getAppData(env.DB);
+        const config = appData.share_config;
+        if (config.status !== 1) return jsonResponse(null, 403, "share mode is disabled");
+        const today = getTodayDateString();
+        const usageCount = appData.usage.daily[today]?.share || 0;
+        if (usageCount >= config.daily_limit) return jsonResponse(null, 429, "daily share limit reached");
+        ctx.waitUntil(incrementCounters(env.DB, false));
+        return await withTimeout(handleGetSongListDetailByLink(request), REQUEST_TIMEOUT_MS);
+      }
+    }
+
+    // apiKey 路由：/{apiKey}/status（供客户端测试连通性和版本检查）
+    if (apiKeyInPath === apiKey && pathParts.length >= 2 && pathParts[1] === "status" && request.method === "GET") {
+      return await handleOwnerStatus(request, env);
+    }
+    } catch (error: any) {
+      return jsonResponse(null, 500, error.message || 'Internal Server Error');
+    }
     
     const isApiCall = pathParts.length >= 2 && (pathParts[1] === 'api' || pathParts[1] === 'scripts');
     if (isApiCall && apiKeyInPath !== apiKey) return jsonResponse(null, 401, '无效的 API Key');
@@ -935,14 +1638,13 @@ export default {
         case `POST /${apiKey}/api/scripts/import/raw`:
           return await withTimeout(handleImportScriptRaw(request, storage), REQUEST_TIMEOUT_MS);
 
-        case `POST /${apiKey}/api/music/url`:
-          return await withTimeout(handleGetMusicUrl(request, storage), REQUEST_TIMEOUT_MS);
+case `POST /${apiKey}/api/music/url`:
+ctx.waitUntil(incrementCounters(env.DB, false));
+return await withTimeout(handleGetMusicUrl(request, storage, env), REQUEST_TIMEOUT_MS);
 
         case `POST /${apiKey}/api/music/lyric`:
+          ctx.waitUntil(incrementCounters(env.DB, false));
           return await withTimeout(handleGetLyric(request), REQUEST_TIMEOUT_MS);
-
-        case `POST /${apiKey}/api/music/url/inline`:
-          return await withTimeout(handleGetMusicUrlWithScript(request), REQUEST_TIMEOUT_MS);
 
         case `GET /${apiKey}/api/scripts/loaded`:
           return await withTimeout(handleGetLoadedScripts(request, storage), REQUEST_TIMEOUT_MS);
@@ -957,12 +1659,15 @@ export default {
           return await withTimeout(handleDeleteScript(request, storage), REQUEST_TIMEOUT_MS);
 
         case `GET /${apiKey}/api/search`: case `GET /${apiKey}/api/search/`:
+          ctx.waitUntil(incrementCounters(env.DB, false));
           return await withTimeout(handleSearch(request), REQUEST_TIMEOUT_MS);
 
         case `POST /${apiKey}/api/songlist/detail`:
+          ctx.waitUntil(incrementCounters(env.DB, false));
           return await withTimeout(handleGetSongListDetail(request), REQUEST_TIMEOUT_MS);
 
         case `POST /${apiKey}/api/songlist/detail/by-link`:
+          ctx.waitUntil(incrementCounters(env.DB, false));
           return await withTimeout(handleGetSongListDetailByLink(request, storage), REQUEST_TIMEOUT_MS);
 
         case `POST /${apiKey}/api/ai/chat`:
@@ -1008,8 +1713,16 @@ function corsHeaders(): Record<string, string> {
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), ms);
-  try { const result = await promise; clearTimeout(timeoutId); return result; }
-  catch (error: any) { clearTimeout(timeoutId); if (error.name === 'AbortError') throw new Error('请求超时 (' + ms + 'ms)'); throw error; }
+  let timeoutId: ReturnType<typeof setTimeout>;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error('请求超时 (' + ms + 'ms)')), ms);
+  });
+  try {
+    const result = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId!);
+    return result as T;
+  } catch (error: any) {
+    clearTimeout(timeoutId!);
+    throw error;
+  }
 }

@@ -1,4 +1,4 @@
-name = "cf-phg-music-server"
+name = "test01-phg-music-server"
 main = "src/index.ts"
 compatibility_date = "2024-08-05"
 compatibility_flags = [ "nodejs_compat" ]
@@ -6,15 +6,13 @@ compatibility_flags = [ "nodejs_compat" ]
 [ai]
 binding = "AI"
 
-routes = [
-  { pattern = "pinhaoge.us.ci", custom_domain = true }
-]
 
 [vars]
 API_KEY = "c5cb88052fcfc21ee4a48ab7e3d3d964"
+PUBLIC_KEY = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
 AI_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "cf-phg-music-db"
-database_id = "2d94ef59-3920-4478-b138-af547e1e4173"
+database_id = "5515a37a-2d29-4824-9892-dd7edd6aa450"
