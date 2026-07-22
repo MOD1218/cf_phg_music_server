@@ -12,6 +12,3 @@ API_KEY = "c5cb88052fcfc21ee4a48ab7e3d3d964"
 PUBLIC_KEY = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
 AI_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "phg-music-db"
