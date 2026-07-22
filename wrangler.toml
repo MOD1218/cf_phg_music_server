@@ -15,4 +15,3 @@ AI_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
 [[d1_databases]]
 binding = "DB"
 database_name = "phg-music-db"
-database_id = ""
