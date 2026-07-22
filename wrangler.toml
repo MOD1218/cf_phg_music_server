@@ -1,4 +1,4 @@
-name = "test01-phg-music-server"
+name = "phg-music-server"
 main = "src/index.ts"
 compatibility_date = "2024-08-05"
 compatibility_flags = [ "nodejs_compat" ]
@@ -14,5 +14,5 @@ AI_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "cf-phg-music-db"
-database_id = "5515a37a-2d29-4824-9892-dd7edd6aa450"
+database_name = "phg-music-db"
+database_id = ""
