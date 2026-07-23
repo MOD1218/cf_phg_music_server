@@ -69,6 +69,7 @@
 ```
 https://xxxx.workers.dev/你的API_KEY
 ```
+这样你的个人服务器已经可以使用了
 
 #### 第 7 步：注册域名（如需国内访问）
 
@@ -83,7 +84,25 @@ Workers 默认域名（`*.workers.dev`）在中国大陆**无法访问**，需�
 
 **INDEVS.in 注册教程**：[视频教程](https://www.youtube.com/watch?v=7cZC4G7je1U)
 
-#### 第 8 步：绑定自定义域名到 Worker
+#### 第 8 步：将域名托管到 Cloudflare（如需国内访问）
+
+在把自定义域名绑定到 Worker 之前，必须先把域名托管到 Cloudflare（即将域名的 DNS 解析交给 Cloudflare 名称服务器管理）。否则下一步绑定自定义域时会失败。
+
+1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com/) → 左侧菜单 → **域名**
+2. 点击 **添加域名**（或 "Add a domain"）→  **链接域名**
+3. 输入你注册的**域名**（如 `pinhaoge.indevs.in`）→ 点击 **继续**
+4. 在套餐选择页面选择 **Free（免费）** → 点击 **继续**
+5. Cloudflare 会自动扫描并导入现有 DNS 记录，检查无误后点击 **继续**
+6. 页面会显示 Cloudflare 分配给你的两个**名称服务器**（格式如 `xxb.ns.cloudflare.com`，`xxa.ns.cloudflare.com`），复制这两个值
+7. 登录你的域名注册商后台（如 INDEVS.in）
+8. 找到域名的 **DNS / 名称服务器（Nameservers）** 设置，将原有名称服务器替换为 Cloudflare 提供的两个
+9. 保存后回到 Cloudflare，点击 **完成，检查名称服务器**
+10. 等待 Cloudflare 验证通过（状态变为"活跃"，通常几分钟到数小时，最长不超过 24 小时）
+
+> **说明**：
+> - 验证通过后，Cloudflare 才会接管该域名的 DNS，后续才能绑定到 Worker。
+
+#### 第 9 步：绑定自定义域名到 Worker（如需国内访问）
 
 1. 进入你刚部署的 Worker 项目（Cloudflare 左侧菜单 → 计算 → **Workers 和 Pages** → 点击项目`cf-phg-music-server`）
 2. 页面左上角的菜单栏点击"设置"→**域和路由**
