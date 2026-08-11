@@ -2,6 +2,7 @@ node_modules/
 .wrangler/
 dist/
 *.wasm
+!src/afp.wasm
 *.map
 !.wrangler/**
 package-lock.json
