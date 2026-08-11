@@ -1,10 +1,11 @@
 import { ScriptStorage } from './storage.ts';
 import { ScriptRunner } from './script_runner.ts';
-import { SearchService } from './services/search_service.ts';
+import { SearchService, HotSearchService, type HotSearchItem } from './services/search_service.ts';
 import { ShortLinkService } from './services/shortlink_service.ts';
 import { SongListService } from './services/songlist_service.ts';
 import { LyricService } from './services/lyric_service.ts';
-import { AIRecommendService } from './services/ai_recommend_service.ts';
+import { AIRecommendService, type SeedSong, type CandidateSong, type RankedSong, type UserPreferences, type RankResult } from './services/ai_recommend_service.ts';
+import { recognizeAudio } from './services/recognize_service.ts';
 import { AppDataStore, type AppData, type ShareConfig, getTodayDateString, cleanupUsageDaily, defaultAppData } from './app_data.ts';
 import pkg from '../package.json';
 
@@ -19,12 +20,12 @@ export interface Env {
 const REQUEST_TIMEOUT_MS = 30000;
 
 // ==================== 版本信息（来自 package.json） ====================
-const SERVER_VERSION = pkg.version;             // "1.0.10"
-const SERVER_VERSION_CODE = (pkg as any).versionCode || 10010;  // 10010
+const SERVER_VERSION = pkg.version;             // "1.0.11"
+const SERVER_VERSION_CODE = (pkg as any).versionCode || 10011;  // 10011
 const SERVER_PLATFORM = 'cloudflare';
-// 本服务端要求的最低客户端版本
-const MIN_CLIENT_VERSION = '1.0.01';
-const MIN_CLIENT_VERSION_CODE = 1001;
+// 本服务端要求的最低客户端版本（从 package.json 读取）
+const MIN_CLIENT_VERSION = (pkg as any).minClientVersion || '1.0.01';
+const MIN_CLIENT_VERSION_CODE = (pkg as any).minClientVersionCode || 1001;
 
 // ========== ScriptRunner 缓存（CF Workers Isolate 级别） ==========
 // CF Workers 在同一 Isolate 内复用模块级变量。
@@ -91,10 +92,11 @@ async function getOrCreateRunner(scriptInfo: { id: string; name: string; rawScri
 function jsonResponse(data: any, status = 200, msg = 'success', extra?: any): Response {
   const body: any = { code: status === 200 ? 200 : status, msg, data };
   if (extra) Object.assign(body, extra);
-  return Response.json(body, { status });
+  return Response.json(body, { status, headers: corsHeaders() });
 }
 
 const searchService = new SearchService();
+const hotSearchService = new HotSearchService();
 const shortLinkService = new ShortLinkService();
 const songListService = new SongListService();
 const lyricService = new LyricService();
@@ -124,6 +126,371 @@ async function handleAIChat(request: Request, env: Env): Promise<Response> {
   } catch (error: any) {
     console.error('[AI Chat] Error:', error.message);
     return jsonResponse(null, 500, error.message || 'AI 服务调用失败');
+  }
+}
+
+// GET /api/hot-search - 获取5大平台热搜关键词
+async function handleGetHotSearch(): Promise<Response> {
+  try {
+    const result = await hotSearchService.getAllHotSearch();
+    return jsonResponse(result, 200, `获取热搜成功（${result.platforms}个平台，${result.keywords.length}个关键词）`);
+  } catch (error: any) {
+    console.error('[HotSearch] Error:', error.message);
+    return jsonResponse(null, 500, error.message || '获取热搜失败');
+  }
+}
+
+// 热搜缓存（Workers Isolate 级别，5分钟有效期）
+let cachedHotSearch: { data: any; timestamp: number } | null = null;
+const HOT_SEARCH_CACHE_TTL = 5 * 60 * 1000; // 5分钟
+
+// POST /api/ai/recommend - AI推荐编排接口（种子→检索→排序）
+async function handleAIRecommend(request: Request, env: Env): Promise<Response> {
+  const startTime = Date.now();
+  try {
+    const body = await request.json() as any;
+
+    // ── 参数校验 ──
+    // 🔑 允许空种子（新用户探索模式）
+    if (!body.seeds || !Array.isArray(body.seeds)) {
+      body.seeds = [];
+    }
+
+    const seeds: SeedSong[] = (body.seeds || []).map((s: any) => ({
+      name: String(s.name || ''),
+      singer: String(s.singer || ''),
+      album: s.album || ''
+    })).filter((s: SeedSong) => s.name && s.singer);
+
+    // 🔑 新用户探索模式：种子为空时不报错，用热搜词作为探索种子
+    const isNewUserExploration = seeds.length === 0;
+    if (isNewUserExploration) {
+      console.log('[AIRecommend] 🆕 新用户探索模式：无种子歌曲，将用热搜+多样化关键词探索');
+    }
+
+    const excludedKeys: Set<string> = new Set(
+      (body.excludedKeys || []).map((k: string) => String(k).toLowerCase().trim())
+    );
+
+    const userProfile = body.userProfile || null;
+    const preferences: UserPreferences = body.preferences || {};
+    const dislikeArtists: string[] = Array.isArray(body.dislikeArtists) ? body.dislikeArtists.filter((a: any) => typeof a === 'string' && a.trim()).map((a: string) => a.trim()) : [];
+    const aiModel = env.AI_MODEL || '';
+
+    console.log(`[AIRecommend] 🚀 开始编排: 种子${seeds.length}首, 排除${excludedKeys.size}首, 场景=${preferences.scene || '无'}, 自定义=${preferences.customPrompt ? '有' : '无'}, 不喜欢歌手=${dislikeArtists.length}位`);
+
+    // ════════════════════════════════════════
+    // Stage A+B 并行：获取热搜(带缓存) + AI生成关键词
+    // 🔑 优化：两个操作没有依赖关系，可以并行
+    // ════════════════════════════════════════
+    const aiService = new AIRecommendService(env.AI);
+
+    // 热搜带缓存
+    const hotSearchPromise = (async () => {
+      const now = Date.now();
+      if (cachedHotSearch && (now - cachedHotSearch.timestamp) < HOT_SEARCH_CACHE_TTL) {
+        console.log('[AIRecommend] 📡 使用缓存热搜');
+        return cachedHotSearch.data;
+      }
+      console.log('[AIRecommend] 📡 获取新鲜热搜...');
+      const result = await hotSearchService.getAllHotSearch();
+      cachedHotSearch = { data: result, timestamp: now };
+      return result;
+    })();
+
+    // AI关键词生成（不依赖热搜结果，只需要种子+偏好）
+    // 把上一次的热搜keywords传进去做参考（如果缓存有的话）
+    const cachedKeywords = cachedHotSearch?.data?.keywords || [];
+    // 🔑 把dislikeArtists放入preferences，让关键词生成也能读到
+    const kwPreferences = { ...preferences, dislikeArtists: dislikeArtists };
+    const keywordPromise = aiService.generateSearchKeywords(
+      seeds, cachedKeywords, userProfile, kwPreferences, aiModel
+    );
+
+    const [hotSearchResult, searchKeywords] = await Promise.all([hotSearchPromise, keywordPromise]);
+    console.log(`[AIRecommend] ✅ 热搜: ${hotSearchResult.keywords.length}个关键词`);
+    console.log(`[AIRecommend] ✅ 关键词: ${searchKeywords.length}组: ${searchKeywords.join(', ')}`);
+
+    // ════════════════════════════════════════
+    // Stage C: 多平台真实检索（5平台智能分配+随机1-3页）
+    // 🔑 不再先搜page1拿total，直接随机1-3页，无结果回退page1
+    // ════════════════════════════════════════
+    console.log('[AIRecommend] 🔍 Stage C: 多平台检索（5平台+随机1-3页）...');
+
+    // 辅助函数：直接随机1-3页，无结果回退page1
+    const searchRandomPage = async (kw: string, src: string, limit: number) => {
+      try {
+        // 直接随机1-3页（前3页质量最高）
+        const randomPage = Math.floor(Math.random() * 3) + 1;
+        const results = await searchService.search(kw, src, randomPage, limit);
+        if (Array.isArray(results) && results.length > 0 && results[0]?.results?.length) {
+          console.log(`[AIRecommend]   [${src}] "${kw}" page${randomPage}: ${results[0].results.length}首`);
+          return results;
+        }
+        // 随机页无结果，回退第一页
+        if (randomPage !== 1) {
+          console.log(`[AIRecommend]   [${src}] "${kw}" page${randomPage}无结果，回退page1`);
+          const fallback = await searchService.search(kw, src, 1, limit);
+          return fallback || [];
+        }
+        return [];
+      } catch (e) {
+        console.error(`[AIRecommend]   [${src}] "${kw}" 搜索失败:`, e);
+        return [];
+      }
+    };
+
+    // 🔑 平台均衡分配：确保5个平台都有充分搜索覆盖
+    // 每个关键词至少搜2个平台，5个平台均衡轮转
+    const allSources = ['tx', 'kg', 'wy', 'kw', 'mg'];
+    const searchPromises: Promise<any>[] = [];
+    searchKeywords.forEach((kw, i) => {
+      // 每个关键词搜2个平台，按关键词索引轮转，确保5个平台均匀覆盖
+      const src1 = allSources[i % allSources.length];
+      const src2 = allSources[(i + 2) % allSources.length];
+      searchPromises.push(searchRandomPage(kw, src1, 20));
+      searchPromises.push(searchRandomPage(kw, src2, 20));
+      console.log(`[AIRecommend]   关键词"${kw}" → [${src1}] + [${src2}]`);
+    });
+
+    // 补充：从热搜随机选1个词搜剩余平台（确保5平台都覆盖到）
+    const coveredSources = new Set(searchKeywords.map((_, i) => allSources[i % allSources.length]));
+    const uncoveredSources = allSources.filter(s => !coveredSources.has(s));
+    if (uncoveredSources.length > 0) {
+      const explorationKeyword = hotSearchResult.keywords
+        .sort(() => Math.random() - 0.5)[0];
+      if (explorationKeyword) {
+        for (const src of uncoveredSources) {
+          searchPromises.push(searchRandomPage(explorationKeyword, src, 20));
+        }
+      }
+    }
+
+    const searchResults = await Promise.all(searchPromises);
+    console.log(`[AIRecommend] ✅ 搜索完成: ${searchResults.length}个请求`);
+
+    // 🔑 诊断：统计每个平台返回的歌曲数
+    const platformStats: Record<string, number> = {};
+    for (const result of searchResults) {
+      if (!Array.isArray(result) || result.length === 0) continue;
+      for (const platformResult of result) {
+        if (!platformResult?.results) continue;
+        const platform = platformResult.platform || '?';
+        platformStats[platform] = (platformStats[platform] || 0) + platformResult.results.length;
+      }
+    }
+    console.log(`[AIRecommend] 📊 各平台返回歌曲数:`, platformStats);
+
+    // ════════════════════════════════════════
+    // Stage D: 去重 + 排除过滤 + 多样性约束
+    // ════════════════════════════════════════
+    console.log('[AIRecommend] 🧹 Stage D: 去重+过滤...');
+
+    const seenKeys = new Set<string>();
+    const artistCount = new Map<string, number>();
+    const MAX_PER_ARTIST = 3;
+    const rawCandidates: CandidateSong[] = [];
+    let totalRaw = 0;
+
+    for (const result of searchResults) {
+      if (!Array.isArray(result) || result.length === 0) continue;
+      for (const platformResult of result) {
+        if (!platformResult?.results) continue;
+        for (const song of platformResult.results) {
+          totalRaw++;
+          const name = String(song.name || '').trim();
+          const singer = String(song.singer || '').trim();
+          if (!name || !singer) continue;
+
+          // 🔑 过滤非音乐内容（有声书、播客、广播剧等）
+          if (/^第[一二三四五六七八九十百千\d]+[章集话回篇]/.test(name)) continue;
+          if (/喜马拉雅|中广影音|蜻蜓fm|荔枝fm|资讯电台|电台|FM|广播/i.test(singer)) continue;
+          if (name.length > 30) continue;
+          // 🔑 过滤hashtag垃圾（#说唱 #中文说唱 等）
+          if (/^#/.test(name)) continue;
+          if ((name.match(/#/g) || []).length >= 2 && name.length < 20) continue;
+          // 🔑 过滤非音乐专辑/内容
+          if (/鬼故事|广播剧|有声|评书|睡前|故事会|文案|BGM|配乐|背景音/.test(song.albumName || '')) continue;
+          if (/鬼故事|广播剧|有声|评书|睡前|故事会|文案|配乐|背景音/.test(name)) continue;
+          
+          // 🔑 候选歌曲语言过滤：用户选了特定语言时，过滤掉不匹配的候选歌曲
+          const selLang = preferences?.language;
+          if (selLang === 'japanese_korean') {
+            // 日韩：歌手名或歌名含日文(平假名/片假名)或韩文(Hangul)，或歌手名纯英文(可能是K-pop)
+            const hasHangul = /[가-힣]/.test(singer) || /[가-힣]/.test(name);
+            const hasKana = /[\u3040-\u309f\u30a0-\u30ff]/.test(singer) || /[\u3040-\u309f\u30a0-\u30ff]/.test(name);
+            const isLatinSinger = /^[a-zA-Z0-9\s&.,'!-]+$/.test(singer) && singer.length > 1;
+            if (!hasHangul && !hasKana && !isLatinSinger) continue;
+          } else if (selLang === 'western') {
+            // 欧美：排除纯中文名/韩文/日文的歌手
+            if (/[\u4e00-\u9fff]/.test(singer) || /[가-힣]/.test(singer) || /[\u3040-\u309f\u30a0-\u30ff]/.test(singer)) continue;
+          } else if (selLang === 'chinese') {
+            // 华语：歌手名必须含中文字符
+            if (!/[\u4e00-\u9fff]/.test(singer)) continue;
+          }
+          
+          // 🔑 场景过滤：运动健身时排除明显不适合的歌曲
+          const selScene = preferences?.scene;
+          if (selScene === '运动健身') {
+            // 排除歌名含抒情/慢歌/悲伤/思念/泪/心碎等关键词的歌曲
+            if (/伤|泪|哭|痛|心碎|思念|想你|孤独|寂寞|离别|分手|忘|等|安静|温柔|催眠|睡|轻柔|舒缓|疗伤|治愈|低落|难过|遗憾|失去|错过|回忆|怀念/.test(name)) continue;
+          }
+          
+          // 🔑 过滤过短内容（大概率不是完整歌曲）
+          const durStr = String(song.interval || '');
+          const durMatch = durStr.match(/(\d+):(\d+)/);
+          if (durMatch) {
+            const durSec = parseInt(durMatch[1]) * 60 + parseInt(durMatch[2]);
+            if (durSec < 30) continue;
+          }
+
+          // 去重 key
+          const dedupKey = `${name.toLowerCase()}-${singer.toLowerCase()}`;
+          if (seenKeys.has(dedupKey)) continue;
+
+          // 排除已听过/已收藏的（排除列表只含实际播放过的歌）
+          const excludeKey = `${name} - ${singer}`.toLowerCase();
+          if (excludedKeys.has(excludeKey)) continue;
+
+          // 多样性约束：同一歌手最多3首
+          const currentArtistCount = artistCount.get(singer) || 0;
+          if (currentArtistCount >= MAX_PER_ARTIST) continue;
+
+          seenKeys.add(dedupKey);
+          artistCount.set(singer, currentArtistCount + 1);
+
+          const platform = song.source || platformResult.platform;
+          let songId = song.id || '';
+          let songmid = song.songmid || '';
+          let hash = song.hash || '';
+
+          // 酷狗(kg)主ID是hash，酷我/咪咕可能有copyrightId
+          if (!songId && hash) songId = hash;           // kg: hash → id
+          if (!songId && songmid) songId = songmid;      // tx: songmid → id
+          if (!songId && song.copyrightId) songId = song.copyrightId; // mg: copyrightId → id
+          // 确保songmid有值（播放URL请求需要）
+          if (!songmid && songId) songmid = songId;
+          if (!hash && songId && platform === 'kg') hash = songId;
+
+          rawCandidates.push({
+            index: rawCandidates.length + 1,
+            name, singer,
+            albumName: song.albumName || '',
+            source: platform,
+            id: songId,
+            songmid,
+            hash,
+            img: song.img,
+            interval: song.interval
+          });
+        }
+      }
+    }
+    console.log(`[AIRecommend] ✅ 过滤完成: 原始${totalRaw}首 → 去重排除后${rawCandidates.length}首`);
+    // 🔑 记录候选歌曲平台分布（用于诊断）
+    const candidatePlatformDist: Record<string, number> = {};
+    for (const c of rawCandidates) {
+      candidatePlatformDist[c.source] = (candidatePlatformDist[c.source] || 0) + 1;
+    }
+    console.log(`[AIRecommend] 📊 候选歌曲平台分布:`, candidatePlatformDist);
+
+    if (rawCandidates.length === 0) {
+      return jsonResponse(null, 404, '检索结果全部被排除，请减少排除项或稍后重试');
+    }
+
+    // ════════════════════════════════════════
+    // Stage E: AI 排序 + 生成推荐理由
+    // ════════════════════════════════════════
+    console.log('[AIRecommend] 🎯 Stage E: AI排序+生成理由...');
+    const rankResult = await aiService.rankCandidates(
+      seeds, rawCandidates, userProfile, preferences, aiModel, searchKeywords, dislikeArtists
+    );
+    console.log(`[AIRecommend] ✅ AI排序完成: method=${rankResult.method}, 选出${rankResult.songs.length}首${rankResult.error ? ', error=' + rankResult.error : ''}`);
+    if (rankResult.method === 'keyword_fallback') {
+      console.log(`[AIRecommend] ⚠️ AI排序失败，降级到关键词打分。 AI响应长度=${rankResult.aiResponseLength}, 预览=${rankResult.aiResponsePreview}`);
+    }
+
+    // ════════════════════════════════════════
+    // Stage F: 映射回真实歌曲对象
+    // ════════════════════════════════════════
+    const finalSongs = rankResult.songs.map((r: RankedSong) => {
+      const candidate = rawCandidates.find(c => c.index === r.index);
+      if (!candidate) return null;
+      return {
+        name: candidate.name,
+        singer: candidate.singer,
+        album: candidate.albumName,
+        source: candidate.source,
+        id: candidate.id,
+        songmid: candidate.songmid || '',
+        hash: candidate.hash || '',
+        img: candidate.img || '',
+        interval: candidate.interval || '',
+        duration: candidate.interval || '',
+        reason: r.reason,
+        category: r.category
+      };
+    }).filter(Boolean);
+
+    const elapsed = Date.now() - startTime;
+    console.log(`[AIRecommend] ✅ 编排完成: ${finalSongs.length}首, 耗时${elapsed}ms`);
+
+    return jsonResponse({
+      songs: finalSongs,
+      meta: {
+        totalCount: finalSongs.length,
+        seedCount: seeds.length,
+        candidateCount: rawCandidates.length,
+        searchKeywordCount: searchKeywords.length,
+        searchKeywords: searchKeywords,
+        hotSearchCount: hotSearchResult.keywords.length,
+        rankingMethod: rankResult.method,
+        rankingError: rankResult.error || undefined,
+        elapsedMs: elapsed
+      }
+    });
+
+  } catch (error: any) {
+    console.error('[AIRecommend] Error:', error.message);
+    return jsonResponse(null, 500, error.message || 'AI推荐编排失败');
+  }
+}
+
+// POST /api/music/recognize - 听歌识曲
+async function handleRecognize(request: Request): Promise<Response> {
+  try {
+    const contentType = request.headers.get('content-type') || '';
+    let audioBuffer: ArrayBuffer;
+
+    console.log('[Recognize] Request content-type:', contentType);
+
+    // 支持 multipart/form-data 和直接二进制上传
+    if (contentType.includes('multipart/form-data')) {
+      const formData = await request.formData();
+      const file = formData.get('audio') as File | null;
+      if (!file) {
+        console.log('[Recognize] 400: 缺少 audio 文件');
+        return jsonResponse(null, 400, '缺少 audio 文件');
+      }
+      audioBuffer = await file.arrayBuffer();
+    } else {
+      // 直接二进制上传 (audio/wav)
+      audioBuffer = await request.arrayBuffer();
+    }
+
+    console.log('[Recognize] Audio buffer size:', audioBuffer.byteLength, 'bytes');
+
+    if (audioBuffer.byteLength < 100) {
+      console.log('[Recognize] 400: 音频文件太小 (' + audioBuffer.byteLength + ' bytes)');
+      return jsonResponse(null, 400, '音频文件太小: ' + audioBuffer.byteLength + ' bytes');
+    }
+
+    console.log('[Recognize] Received audio:', audioBuffer.byteLength, 'bytes');
+    const result = await recognizeAudio(audioBuffer);
+    return jsonResponse(result);
+  } catch (error: any) {
+    console.error('[Recognize] Error:', error.message, error.stack);
+    return jsonResponse(null, 500, error.message || '识曲失败');
   }
 }
 
@@ -1672,6 +2039,15 @@ return await withTimeout(handleGetMusicUrl(request, storage, env), REQUEST_TIMEO
 
         case `POST /${apiKey}/api/ai/chat`:
           return await withTimeout(handleAIChat(request, env), REQUEST_TIMEOUT_MS);
+
+        case `GET /${apiKey}/api/hot-search`: case `GET /${apiKey}/api/hot-search/`:
+          return await withTimeout(handleGetHotSearch(), REQUEST_TIMEOUT_MS);
+
+        case `POST /${apiKey}/api/ai/recommend`:
+          return await withTimeout(handleAIRecommend(request, env), 120000);
+
+        case `POST /${apiKey}/api/music/recognize`:
+          return await withTimeout(handleRecognize(request), 30000);
 
         case `GET /${apiKey}/api/ai/models`: case `GET /${apiKey}/api/ai/models/`:
           return await withTimeout(handleGetAIModels(), REQUEST_TIMEOUT_MS);

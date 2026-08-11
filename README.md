@@ -2,7 +2,7 @@
 
 这是一个用 Cloudflare Workers + QuickJS（quickjs-ng.wasm）构建的拼好歌后端服务框架，支持动态执行用户导入的音源脚本插件。本项目不提供音乐数据，数据全部由用户自行导入的脚本返回。此项目参考洛雪音乐源码编写，兼容洛雪音乐第三方音源脚本生态（小部分不兼容）。本项目代码开源且免费，如付费使用，建议申请退款。
 
-**当前版本：v1.0.10 (versionCode: 10010)**
+**当前版本：v1.0.11 (versionCode: 10011)**
 
 ## 关联项目
 
@@ -330,15 +330,15 @@ Content-Type: application/json
 
 | 字段                | 类型        | 必填 | 说明                                          |
 | ----------------- | --------- | -- | ------------------------------------------- |
-| source            | string    | 是  | 音乐平台代码：kw=酷我, kg=酷狗, tx=QQ音乐, wy=网易云, mg=咪咕 |
+| source            | string    | 是  | 音源平台代码：kw=kw平台, kg=kg平台, tx=tx平台, wy=wy平台, mg=mg平台 |
 | quality           | string    | 是  | 音质：128k, 320k, flac, flac24bit              |
 | songmid           | string    | 否  | 歌曲ID（通用字段）                                  |
 | id                | string    | 否  | 歌曲ID（songmid的别名）                            |
 | name              | string    | 否  | 歌曲名称（用于换源匹配）                                |
 | singer            | string    | 否  | 歌手名称（用于换源匹配）                                |
-| hash              | string    | 否  | 酷狗专用：歌曲hash                                 |
-| songId            | string    | 否  | 酷狗/QQ/网易云专用：歌曲ID                            |
-| copyrightId       | string    | 否  | 咪咕专用：版权ID                                   |
+| hash              | string    | 否  | kg平台专用：歌曲hash                               |
+| songId            | string    | 否  | kg/tx/wy平台专用：歌曲ID                           |
+| copyrightId       | string    | 否  | mg平台专用：版权ID                                 |
 | interval          | string    | 否  | 歌曲时长（格式：mm:ss，用于换源匹配）                       |
 | musicInfo         | object    | 否  | 完整歌曲信息对象（可替代上述字段）                           |
 | allowToggleSource | boolean   | 否  | 是否允许换源，默认true                               |
@@ -421,14 +421,93 @@ Content-Type: application/json
 | ------ | ------ | -- | ------------- |
 | source | string | 是  | 音乐平台代码        |
 | songId | string | 是  | 歌曲ID          |
-| name   | string | 否  | 歌曲名称（咪咕、酷狗需要） |
-| singer | string | 否  | 歌手名称（咪咕需要）    |
+| name   | string | 否  | 歌曲名称（mg/kg平台需要） |
+| singer | string | 否  | 歌手名称（mg平台需要）    |
 
 ***
 
-## 三、搜索接口
+## 三、听歌识曲接口（v1.0.11 新增）
 
-### 3.1 搜索歌曲
+### 3.1 听歌识曲
+
+```http
+POST /{apiKey}/api/music/recognize
+Content-Type: multipart/form-data 或 application/octet-stream
+```
+
+接收音频文件（WAV格式），返回识别到的歌曲列表。
+
+**请求参数：**
+
+| 字段  | 类型 | 必填 | 说明                    |
+| ----- | ---- | -- | ----------------------- |
+| file  | file | 是  | 音频文件（WAV格式，建议3-15秒） |
+| audio | file | 是  | 同 file，兼容字段名       |
+
+**请求示例（curl）：**
+
+```bash
+curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/api/music/recognize \
+  -H 'Content-Type: multipart/form-data' \
+  -F 'file=@/path/to/audio.wav'
+```
+
+**响应示例：**
+
+```json
+{
+  "code": 200,
+  "msg": "success",
+  "data": [
+    {
+      "songmid": "123456789",
+      "name": "歌曲名称",
+      "singer": "歌手名称",
+      "albumName": "专辑名称",
+      "albumId": 123456,
+      "source": "wy",
+      "interval": "03:45",
+      "img": "https://example.com/cover.jpg",
+      "startTime": 12.5,
+      "types": [
+        { "type": "flac", "size": "25.3MB" },
+        { "type": "320k", "size": "8.5MB" }
+      ],
+      "_types": {
+        "flac": { "size": "25.3MB" },
+        "320k": { "size": "8.5MB" }
+      }
+    }
+  ]
+}
+```
+
+**字段说明：**
+
+| 字段       | 类型   | 说明                           |
+| ---------- | ------ | ------------------------------ |
+| songmid    | string | 歌曲ID                         |
+| name       | string | 歌曲名称                       |
+| singer     | string | 歌手名称                       |
+| albumName  | string | 专辑名称                       |
+| source     | string | 音源平台代码（wy/kg/kw/tx/mg） |
+| interval   | string | 歌曲时长（格式：mm:ss）        |
+| img        | string | 专辑封面图片URL                |
+| startTime  | number | 匹配到的起始时间（秒）         |
+| types      | array  | 可用音质列表                   |
+
+**注意事项：**
+
+- 音频格式：仅支持 WAV 格式
+- 音频时长：建议 3-15 秒，过短可能影响识别准确率
+- 识别原理：使用 Shazam v2 指纹算法，通过 wy 平台接口识别
+- 识别准确率：受音频质量、背景噪音影响
+
+***
+
+## 四、搜索接口
+
+### 4.1 搜索歌曲
 
 ```http
 GET /{apiKey}/api/search?keyword=演员&source=kw&page=1&limit=20
@@ -443,9 +522,9 @@ GET /{apiKey}/api/search?keyword=演员&source=kw&page=1&limit=20
 
 ***
 
-## 四、歌单接口
+## 五、歌单接口
 
-### 4.1 获取歌单详情
+### 5.1 获取歌单详情
 
 ```http
 POST /{apiKey}/api/songlist/detail
@@ -457,20 +536,20 @@ Content-Type: application/json
 }
 ```
 
-### 4.2 通过短链接获取歌单详情
+### 5.2 通过短链接获取歌单详情
 
 ```http
 POST /{apiKey}/api/songlist/detail/by-link
 Content-Type: application/json
 
 {
-  "link": "https://music.163.com/#/playlist?id=123456789"
+  "link": "https://music.example.com/#/playlist?id=123456789"
 }
 ```
 
 ***
 
-## 五、分享计划接口（v1.0.10 新增）
+## 六、分享计划接口（v1.0.10 新增）
 
 分享计划允许服务器所有者将自己的音源脚本共享给"公共服务器模式"的用户。通过 `PUBLIC_KEY` 暴露公共路由，与 `API_KEY` 管理路由分离。
 
@@ -544,16 +623,16 @@ Content-Type: application/json
 }
 ```
 
-### 5.3 共享歌单详情
+### 6.3 共享歌单详情
 
 ```http
 POST /{publicKey}/share/songlist-detail
 Content-Type: application/json
 ```
 
-供免费模式客户端获取QQ音乐歌单（小程序无法设置正确的 Referer）。
+供免费模式客户端获取 wy 平台歌单（小程序无法设置正确的 Referer）。
 
-### 5.4 管理分享配置
+### 6.4 管理分享配置
 
 ```http
 POST /owner/{apiKey}/share/config
@@ -576,7 +655,7 @@ Content-Type: application/json
 
 > 每次开启分享（status→1）时自动重新生成 `node_id`。
 
-### 5.5 注册中心踢下线
+### 6.5 注册中心踢下线
 
 ```http
 POST /{publicKey}/share/config
@@ -591,7 +670,7 @@ Content-Type: application/json
 
 ***
 
-## 六、音质代码对照表
+## 七、音质代码对照表
 
 | 代码        | 音质     | 说明          |
 | --------- | ------ | ----------- |
@@ -600,11 +679,11 @@ Content-Type: application/json
 | flac      | 无损音质   | FLAC        |
 | flac24bit | Hi-Res | 24bit FLAC  |
 
-**注意**：实际可用音质取决于各平台和歌曲本身的支持情况。
+**注意**：实际可用音质取决于各音源平台和歌曲本身的支持情况。
 
 ***
 
-## 七、换源机制
+## 八、换源机制
 
 当原始源获取失败时，服务器会自动搜索其他平台，按歌名+歌手匹配最佳结果并重试。
 
@@ -634,7 +713,7 @@ tryToggleSourceInternal() — 按匹配度+成功率排序，依次尝试
 
 ***
 
-## 八、curl 测试命令
+## 九、curl 测试命令
 
 ### 获取服务信息
 
@@ -684,6 +763,14 @@ curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/
   -d '{"source": "kw", "songId": "MUSIC_12345678"}'
 ```
 
+### 听歌识曲
+
+```bash
+curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的API_KEY/api/music/recognize \
+  -H 'Content-Type: multipart/form-data' \
+  -F 'file=@/path/to/audio.wav'
+```
+
 ### 公共分享接口测试
 
 ```bash
@@ -703,7 +790,7 @@ curl -X POST https://cf-phg-music-server.你的账户.workers.dev/你的PUBLIC_K
 
 ***
 
-## 九、脚本开发指南
+## 十、脚本开发指南
 
 建议参考洛雪音乐的指引：<https://lxmusic.toside.cn/desktop/custom-source>
 
@@ -779,7 +866,7 @@ const md5Hash = lx.utils.crypto.md5('string');
 
 ***
 
-## 十、环境变量
+## 十一、环境变量
 
 | 变量名        | 说明                                                                 |
 | ---------- | ------------------------------------------------------------------ |
@@ -796,7 +883,7 @@ const md5Hash = lx.utils.crypto.md5('string');
 
 ***
 
-## 十一、错误码
+## 十二、错误码
 
 | 状态码 | 说明                          |
 | --- | --------------------------- |
@@ -811,7 +898,7 @@ const md5Hash = lx.utils.crypto.md5('string');
 
 ***
 
-## 十二、用户协议与免责声明
+## 十三、用户协议与免责声明
 
 本项目基于 Apache License 2.0 许可证发行，以下协议是对于 Apache License 2.0 的补充，如有冲突，以以下协议为准。
 

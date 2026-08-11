@@ -3,6 +3,8 @@ import { aesEncryptECB } from '../utils/aes.ts';
 
 export interface SearchResult {
   platform: string;
+  total: number;    // 搜索结果总数
+  allPage: number; // 总页数
   results: Array<{id:string;name:string;singer:string;albumName:string;interval:string;source:string;songmid?:string;hash?:string;img?:string}>;
 }
 
@@ -35,12 +37,13 @@ class KuwoSearchService {
       const url=`http://search.kuwo.cn/r.s?client=kt&all=${encodeURIComponent(kw)}&pn=${p-1}&rn=${l}&uid=794762570&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newver=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1&issubtitle=1`;
       const r=await fetch(url,{headers:{'User-Agent':'Mozilla/5.0','Referer':'http://www.kuwo.cn'}});
       const d=await r.json();
-      return {platform:'kw',results:(d.abslist||[]).map((i:any)=>({
+      const total=Number(d.TOTAL||d.total||0);
+      return {platform:'kw',total,allPage:total?Math.ceil(total/l):0,results:(d.abslist||[]).map((i:any)=>({
         id:String(i.MUSICRID).replace('MUSIC_',''),name:i.NAME,singer:i.ARTIST,
         albumName:i.ALBUM||'',interval:i.DURATION?Math.floor(i.DURATION/60)+':'+String(i.DURATION%60).padStart(2,'0'):'00:00',
         source:'kw',songmid:String(i.MUSICRID).replace('MUSIC_',''),img:i.albumpic?.replace('{size}','100')||''
       }))};
-    }catch(e){console.error('[KuwoSearch]',e);return{platform:'kw',results:[]};}
+    }catch(e){console.error('[KuwoSearch]',e);return{platform:'kw',total:0,allPage:0,results:[]};}
   }
 }
 class KugouSearchService {
@@ -55,13 +58,14 @@ class KugouSearchService {
       if(!rawText.trim()) return{platform:'kg',results:[]};
       const d=JSON.parse(rawText);
       const info=d.data?.info||[];
-      if(info.length>0) return{platform:'kg',results:info.map((i:any)=>({
+      const total=Number(d.data?.total||0);
+      if(info.length>0) return{platform:'kg',total,allPage:total?Math.ceil(total/l):0,results:info.map((i:any)=>({
         id:i.album_id||'',name:i.songname||'',singer:i.singername||'',
         albumName:i.album_name||'',interval:i.duration?Math.floor(i.duration/60)+':'+String(i.duration%60).padStart(2,'0'):'00:00',
         source:'kg',hash:i.hash||'',img:''
       }))};
-      return{platform:'kg',results:[]};
-    }catch(e){console.error('[KugouSearch]',e);return{platform:'kg',results:[]}};
+      return{platform:'kg',total:0,allPage:0,results:[]};
+    }catch(e){console.error('[KugouSearch]',e);return{platform:'kg',total:0,allPage:0,results:[]}};
   }
 }
 class QQMusicSearchService {
@@ -74,13 +78,14 @@ class QQMusicSearchService {
       const r=await fetch('https://u.y.qq.com/cgi-bin/musicu.fcg',{method:'POST',headers:{'User-Agent':'QQMusic 14090508(android 12)','Content-Type':'application/json'},body});
       const d=await r.json();
       const songs=(d?.req?.data?.body?.item_song||[]).filter((i:any)=>i&&i.name&&i.file?.media_mid);
-      return{platform:'tx',results:songs.map((i:any)=>({
-        id:String(i.id),name:(i.name||'')+(i.title_extra||''),
+      const total=Number(d?.req?.data?.meta?.estimate_sum||0);
+      return{platform:'tx',total,allPage:total?Math.ceil(total/l):0,results:songs.map((i:any)=>({
+        id:String(i.id||''),name:(i.name||'')+(i.title_extra||''),
         singer:i.singer?.map((s:any)=>s.name).join('\u3001')||'',albumName:i.album?.name||'',
         interval:String(Math.floor((i.interval||0)/60))+':'+String((i.interval||0)%60).padStart(2,'0'),
-        source:'tx',songmid:i.mid,img:i.album?.mid?`https://y.gtimg.cn/music/photo_new/T002R500x500M000${i.album.mid}.jpg`:''
+        source:'tx',songmid:i.mid||i.file?.media_mid||'',img:i.album?.mid?`https://y.gtimg.cn/music/photo_new/T002R500x500M000${i.album.mid}.jpg`:''
       }))};
-    }catch(e){console.error('[QQMusicSearch]',e);return{platform:'tx',results:[]};}
+    }catch(e){console.error('[QQMusicSearch]',e);return{platform:'tx',total:0,allPage:0,results:[]};}
   }
 }
 class NeteaseSearchService {
@@ -99,12 +104,13 @@ class NeteaseSearchService {
       const r=await fetch('http://interface.music.163.com/eapi/batch',{method:'POST',headers:{'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36','Origin':'https://music.163.com','Referer':'https://music.163.com/','Content-Type':'application/x-www-form-urlencoded'},body:`params=${params}`});
       const d=await r.json();
       const songs=d.result?.songs||[];
-      return{platform:'wy',results:songs.map((i:any)=>({
+      const total=Number(d.result?.songCount||0);
+      return{platform:'wy',total,allPage:total?Math.ceil(total/l):0,results:songs.map((i:any)=>({
         id:String(i.id),name:i.name,singer:i.ar?.map((a:any)=>a.name).join('\u3001')||'',
         albumName:i.al?.name||'',interval:i.dt?Math.floor(i.dt/60000)+':'+String(Math.floor(i.dt/1000)%60).padStart(2,'0'):'00:00',
         source:'wy',songmid:String(i.id),img:i.al?.picUrl||''
-      }))};
-    }catch(e){console.error('[NeteaseSearch]',e);return{platform:'wy',results:[]};}
+     }))};
+    }catch(e){console.error('[NeteaseSearch]',e);return{platform:'wy',total:0,allPage:0,results:[]};}
   }
 }
 class MiguSearchService {
@@ -129,10 +135,130 @@ class MiguSearchService {
           if(results.length>=l)break;
         }if(results.length>=l)break;
       }
-      return{platform:'mg',results};
-    }catch(e){console.error('[MiguSearch]',e);return{platform:'mg',results:[]};}
+      const total=Number(d.songResultData?.totalCount||d.totalCount||0);
+      return{platform:'mg',total,allPage:total?Math.ceil(total/l):0,results};
+    }catch(e){console.error('[MiguSearch]',e);return{platform:'mg',total:0,allPage:0,results:[]};}
   }
 }
+// ════════════════════════════════════════════════════
+// 热搜服务 - 获取5大平台热搜关键词
+// ════════════════════════════════════════════════════
+
+export interface HotSearchItem {
+  word: string;
+  score: string;
+  source: string;
+}
+
+export class HotSearchService {
+  async getWyHotSearch(): Promise<HotSearchItem[]> {
+    try {
+      const r = await fetch('https://music.163.com/api/search/chart/detail?id=HOT_SEARCH_SONG%23%40%23');
+      const d = await r.json() as any;
+      const list = d?.data?.itemList || [];
+      return list.slice(0, 10).map((item: any) => ({
+        word: item.searchWord || '',
+        score: item.score ? `${Math.floor(item.score / 10000)}万+` : '热门',
+        source: 'wy'
+      })).filter((item: HotSearchItem) => item.word);
+    } catch (e) { console.error('[HotSearch][wy]', e); return []; }
+  }
+
+  async getTxHotSearch(): Promise<HotSearchItem[]> {
+    try {
+      const body = JSON.stringify({
+        comm: { ct: '19', cv: '1803', guid: '0', patch: '118', uin: '0', wid: '0' },
+        hotkey: { method: 'GetHotkeyForQQMusicPC', module: 'tencent_musicsoso_hotkey.HotkeyService', param: { search_id: '', uin: 0 } }
+      });
+      const r = await fetch('https://u.y.qq.com/cgi-bin/musicu.fcg', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Referer': 'https://y.qq.com/portal/player.html' },
+        body
+      });
+      const d = await r.json() as any;
+      const list = d?.hotkey?.data?.vec_hotkey || [];
+      return list.slice(0, 10).map((item: any) => ({
+        word: item.query || '',
+        score: item.score ? `${Math.floor(item.score / 10000)}万+` : '热门',
+        source: 'tx'
+      })).filter((item: HotSearchItem) => item.word);
+    } catch (e) { console.error('[HotSearch][tx]', e); return []; }
+  }
+
+  async getKgHotSearch(): Promise<HotSearchItem[]> {
+    try {
+      const url = 'http://mobilecdnbj.kugou.com/api/v3/rank/song?version=9108&ranktype=2&plat=0&pagesize=20&area_code=1&page=1&volid=35050&rankid=6666&with_res_tag=1';
+      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const d = await r.json() as any;
+      const info = d?.data?.info || [];
+      return info.slice(0, 10).map((item: any) => {
+        const parts = (item.filename || '').split(' - ');
+        const songName = parts[1] || item.filename || '';
+        return {
+          word: songName,
+          score: item.filesize ? `${Math.floor(item.filesize / 100000)}万+` : '热门',
+          source: 'kg'
+        };
+      }).filter((item: HotSearchItem) => item.word);
+    } catch (e) { console.error('[HotSearch][kg]', e); return []; }
+  }
+
+  async getKwHotSearch(): Promise<HotSearchItem[]> {
+    try {
+      const url = 'http://hotword.kuwo.cn/hotword.s?prod=kwplayer_ar_9.3.0.1&corp=kuwo&newver=2&vipver=9.3.0.1&source=kwplayer_ar_9.3.0.1_40.apk&p2p=1&notrace=0&uid=0&plat=kwplayer_ar&rformat=json&encoding=utf8&tabid=1';
+      const r = await fetch(url, { headers: { 'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9;)' } });
+      const d = await r.json() as any;
+      const list = d?.tagvalue || [];
+      return list.slice(0, 10).map((item: any, index: number) => ({
+        word: item.key || '',
+        score: item.num ? `${Math.floor(item.num / 10000)}万+` : `Top ${index + 1}`,
+        source: 'kw'
+      })).filter((item: HotSearchItem) => item.word);
+    } catch (e) { console.error('[HotSearch][kw]', e); return []; }
+  }
+
+  async getMgHotSearch(): Promise<HotSearchItem[]> {
+    try {
+      const r = await fetch('http://jadeite.migu.cn:7090/music_search/v3/search/hotword');
+      const d = await r.json() as any;
+      const list = d?.data?.hotwords?.[0]?.hotwordList || [];
+      return list.filter((item: any) => item.resourceType === 'song').slice(0, 10).map((item: any, index: number) => ({
+        word: item.word || '',
+        score: item.searchCount ? `${Math.floor(item.searchCount / 10000)}万+` : `Top ${index + 1}`,
+        source: 'mg'
+      })).filter((item: HotSearchItem) => item.word);
+    } catch (e) { console.error('[HotSearch][mg]', e); return []; }
+  }
+
+  async getAllHotSearch(): Promise<{ platforms: number; keywords: string[]; details: HotSearchItem[] }> {
+    const results = await Promise.allSettled([
+      this.getWyHotSearch(),
+      this.getTxHotSearch(),
+      this.getKgHotSearch(),
+      this.getKwHotSearch(),
+      this.getMgHotSearch()
+    ]);
+
+    const allItems: HotSearchItem[] = [];
+    const keywordSet = new Set<string>();
+
+    results.forEach(result => {
+      if (result.status === 'fulfilled') {
+        result.value.forEach(item => {
+          allItems.push(item);
+          keywordSet.add(item.word);
+        });
+      }
+    });
+
+    return {
+      platforms: allItems.length > 0 ? new Set(allItems.map(i => i.source)).size : 0,
+      keywords: Array.from(keywordSet),
+      details: allItems
+    };
+  }
+}
+
 export class SearchService{
   private kw=new KuwoSearchService();private kg=new KugouSearchService();
   private tx=new QQMusicSearchService();private wy=new NeteaseSearchService();private mg=new MiguSearchService();

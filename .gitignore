@@ -25,6 +25,7 @@ index.js
 script_*.js
 
 # 测试文件（含 API_KEY，勿提交）
+test/
 test_app_data_store.py
 test_e2e_real.py
 test_live.py
