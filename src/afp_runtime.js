@@ -1,8 +1,7 @@
 /* eslint-disable no-unreachable */
 // Cloudflare Workers 兼容版 - 从 CeruMusic afp.js 移植
 // 音频指纹生成模块 (Shazam v2 algorithm via WASM)
-// 使用 base64 编码的 WASM 二进制数据，避免直接导入 .wasm 文件
-import { WASM_BINARY } from './afp_wasm_binary.js'
+import _wasmModule from './afp.wasm'
 const WASM_BINARY_PLACEHOLDER = 'WASM_BINARY_PLACEHOLDER'
 // See https://github.com/Distributive-Network/PythonMonkey/issues/266
 if (typeof globalThis.setInterval != 'function') {
@@ -62,17 +61,7 @@ const AudioFingerprintRuntime = () => {
     o.thisProgram && (p = o.thisProgram),
     o.quit && o.quit)
   let w
-  // 使用从 afp_wasm_binary.js 导入的 base64 WASM 数据
-  if (WASM_BINARY) {
-    // 将 base64 字符串转换为 Uint8Array
-    const binaryString = atob(WASM_BINARY)
-    w = new Uint8Array(binaryString.length)
-    for (let i = 0; i < binaryString.length; i++) {
-      w[i] = binaryString.charCodeAt(i)
-    }
-  } else {
-    o.wasmBinary && (w = o.wasmBinary)
-  }
+  o.wasmBinary && (w = o.wasmBinary)
   let b,
     _ = o.noExitRuntime || !0
   'object' != typeof WebAssembly && abort('no native wasm support detected')

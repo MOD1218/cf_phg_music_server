@@ -1918,9 +1918,23 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders() });
 
     const apiKey = env.API_KEY || '';
-    const storage = new ScriptStorage(env.DB, getStore(env.DB));
     const pathParts = url.pathname.split('/').filter(Boolean);
     const apiKeyInPath = pathParts[0];
+    const isApiCall = pathParts.length >= 2 && (pathParts[1] === 'api' || pathParts[1] === 'scripts');
+
+    // 检查是否需要 D1 数据库（识曲接口不需要 D1）
+    const pathSuffix = pathParts.slice(2).join('/');
+    const needsD1 = isApiCall && apiKeyInPath === apiKey &&
+      !pathSuffix.startsWith('music/recognize') &&
+      !pathSuffix.startsWith('hot-search') &&
+      !pathSuffix.startsWith('ai/models');
+
+    // 检查 D1 数据库是否绑定
+    if (needsD1 && !env.DB) {
+      return jsonResponse(null, 503, 'D1 数据库未绑定，请先绑定 D1 数据库');
+    }
+
+    const storage = new ScriptStorage(env.DB, getStore(env.DB));
 
     // ===== Share Plan Routes =====
     try {
@@ -1975,8 +1989,7 @@ export default {
     } catch (error: any) {
       return jsonResponse(null, 500, error.message || 'Internal Server Error');
     }
-    
-    const isApiCall = pathParts.length >= 2 && (pathParts[1] === 'api' || pathParts[1] === 'scripts');
+
     if (isApiCall && apiKeyInPath !== apiKey) return jsonResponse(null, 401, '无效的 API Key');
 
     const pathEndsWith = (suffix: string) => url.pathname.endsWith(suffix);
